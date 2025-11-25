@@ -1,0 +1,27 @@
+# OS files
+.DS_Store
+*~
+
+# IDE
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Logs
+*.log
+
+# Claude Code
+.claude/
