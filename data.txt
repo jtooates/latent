@@ -1,0 +1,65 @@
+This document describes a data generator for physical scenes.
+
+Each scene will contain one or two objects.  Each object has a shape,
+and can optionally have a size and/or color.
+
+If there are two objects they will have a spatial relationship.
+
+IMPLEMENTATION DETAILS:
+- Language: Python
+- Config file format: JSON
+- Interface: Both library and CLI tool
+- CLI should use argparse, accept config file path, and support:
+  * -o/--output flag for output file (default: stdout)
+  * --sentences flag to also print sentences
+- Library should be importable with reusable functions
+
+The data generator should take as input a config file with the
+following information:
+
+  n - the number of scenes to generate
+  p_one - the probability that there is just one object
+  p_color - the probability that an object will have a color
+  p_size - the probability that an object will have a size
+  colors - list of possible colors
+  sizes - list of possible sizes
+  shapes - list of possible shapes
+  rels - list of possible spatial relationships
+
+The output should be JSON that represents each scene with either one
+object with properties or two objects with properties and a spatial
+relationship.  Any missing properties or relations should take on the
+special value "none".
+
+OUTPUT FORMAT:
+{
+  "scenes": [
+    {
+      "objects": [
+        {"shape": "circle", "color": "red", "size": "none"}
+      ],
+      "relationship": "none"
+    },
+    {
+      "objects": [
+        {"shape": "circle", "color": "red", "size": "large"},
+        {"shape": "square", "color": "none", "size": "small"}
+      ],
+      "relationship": "above"
+    }
+  ]
+}
+
+SENTENCE GENERATION:
+The data generator should have a utility function that converts each
+scene into a sentence by reading off non-none values in the first
+object, the spatial relationship if it is not none, and the non-none
+values in the second object.
+
+Sentence format:
+- No articles (a, an, the)
+- Property order: SIZE, COLOR, SHAPE (when both size and color present, size comes first)
+- Examples:
+  * Single object: "large red circle" or "circle" or "red square"
+  * Two objects: "large red circle above small square" or "circle below triangle"
+

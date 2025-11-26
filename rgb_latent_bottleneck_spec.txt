@@ -1,0 +1,217 @@
+RGB Latent Image Bottleneck Extension
+====================================
+
+Goal
+----
+We already have a working pipeline:
+
+  sentence -> text encoder -> latent_vec (dimension d_model) -> property head -> labels
+
+where the property head predicts:
+- Object 1: color, size, shape (or NOT_MENTIONED)
+- Object 2: color, size, shape (or NOT_MENTIONED)
+- Relationship between objects (or NOT_MENTIONED)
+
+Now we want to insert an RGB "image" bottleneck between the text encoder and the classifier, so that:
+
+  sentence -> text encoder -> latent_vec
+                               |
+                               v
+                      ImageBottleneck
+                               |
+                               v
+              Z (RGB latent image, shape [B, 3, N, N])
+                               |
+                               v
+                     CNN-based property head
+                               |
+                               v
+                             labels
+
+The key idea: the classifier must now read information only from the image-like tensor Z, forcing the model to encode semantics in that latent image.
+
+
+1. Image Bottleneck (latent_vec -> RGB image)
+---------------------------------------------
+
+We start from the existing latent vector from the text encoder:
+
+  latent_vec: [B, d_model]
+
+We will map this vector to a flattened RGB image, then reshape to (C, H, W):
+
+- Channels: C = 3 (RGB)
+- Spatial size: N x N (e.g., N = 16 or N = 8)
+
+Define a module like:
+
+  class ImageBottleneck(nn.Module):
+      def __init__(self, d_model, img_size=16, img_channels=3, hidden=256):
+          super().__init__()
+          self.img_size = img_size
+          self.img_channels = img_channels
+          self.mlp = nn.Sequential(
+              nn.Linear(d_model, hidden),
+              nn.ReLU(),
+              nn.Linear(hidden, img_size * img_size * img_channels),
+          )
+
+      def forward(self, latent_vec):
+          '''
+          latent_vec: [B, d_model]
+          returns: Z: [B, img_channels, img_size, img_size]
+          '''
+          B = latent_vec.size(0)
+          x = self.mlp(latent_vec)  # [B, img_channels * img_size * img_size]
+          Z = x.view(B, self.img_channels, self.img_size, self.img_size)
+          return Z
+
+Notes:
+- d_model is the same dimension as the existing text encoder's output.
+- img_size can be a small value like 8 or 16 to keep the latent image compact.
+- The bottleneck is just a small MLP + reshape for now (we can later swap this for a more structured grid-query design).
+
+
+2. CNN-Based Property Head (read from image, not vector)
+--------------------------------------------------------
+
+Previously, the property head took the latent vector directly:
+
+  latent_vec -> MLP -> heads for color/size/shape/rel
+
+Now the property head should take the RGB image Z as its only input.
+
+Pipeline for the new head:
+
+  Z [B, 3, N, N]
+    -> small CNN (Conv2d + ReLU layers)
+    -> global average pooling over spatial dimensions
+    -> MLP to form a hidden vector
+    -> separate Linear layers (heads) for each property
+
+Example implementation:
+
+  class ImagePropertyHead(nn.Module):
+      def __init__(self, img_channels, n_colors, n_sizes, n_shapes, n_rels):
+          super().__init__()
+          # Convolutional feature extractor over the latent image
+          self.conv = nn.Sequential(
+              nn.Conv2d(in_channels=img_channels, out_channels=32, kernel_size=3, padding=1),
+              nn.ReLU(),
+              nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1),
+              nn.ReLU(),
+          )
+
+          # Global average pooling: collapse H and W to 1x1
+          self.pool = nn.AdaptiveAvgPool2d(1)  # Output shape: [B, 64, 1, 1]
+
+          # MLP to create a hidden representation
+          hidden = 128
+          self.mlp = nn.Sequential(
+              nn.Linear(64, hidden),
+              nn.ReLU(),
+          )
+
+          # Prediction heads (same semantics as before)
+          # Object 1
+          self.color1 = nn.Linear(hidden, n_colors)
+          self.size1  = nn.Linear(hidden, n_sizes)
+          self.shape1 = nn.Linear(hidden, n_shapes)
+          # Object 2
+          self.color2 = nn.Linear(hidden, n_colors)
+          self.size2  = nn.Linear(hidden, n_sizes)
+          self.shape2 = nn.Linear(hidden, n_shapes)
+          # Relationship between objects
+          self.rel    = nn.Linear(hidden, n_rels)
+
+      def forward(self, Z):
+          '''
+          Z: [B, img_channels, H, W]
+          returns: dict of logits for each property
+          '''
+          B = Z.size(0)
+          feat = self.conv(Z)          # [B, 64, H, W]
+          feat = self.pool(feat)       # [B, 64, 1, 1]
+          feat = feat.view(B, 64)      # [B, 64]
+          h = self.mlp(feat)           # [B, hidden]
+          return {
+              'color1': self.color1(h),
+              'size1':  self.size1(h),
+              'shape1': self.shape1(h),
+              'color2': self.color2(h),
+              'size2':  self.size2(h),
+              'shape2': self.shape2(h),
+              'rel':    self.rel(h),
+          }
+
+
+3. End-to-End Pipeline
+----------------------
+
+We now have three main components:
+
+1. Text encoder (already implemented)
+   - Inputs: token_ids, attention mask
+   - Output: latent_vec [B, d_model]
+
+2. ImageBottleneck
+   - Input: latent_vec [B, d_model]
+   - Output: Z [B, 3, N, N]
+
+3. ImagePropertyHead
+   - Input: Z [B, 3, N, N]
+   - Output: logits for each property
+
+Pseudo-forward:
+
+  def forward(token_ids, attn_mask, labels):
+      # 1) Encode sentence
+      latent_vec = text_encoder(token_ids, attn_mask)  # [B, d_model]
+
+      # 2) Map to RGB latent image
+      Z = image_bottleneck(latent_vec)                 # [B, 3, N, N]
+
+      # 3) Predict properties from image
+      outputs = image_property_head(Z)
+      # outputs is a dict:
+      #   'color1', 'size1', 'shape1', 'color2', 'size2', 'shape2', 'rel'
+
+      # 4) Compute cross-entropy losses for each property using labels
+      #    labels_color1, labels_size1, etc. are integer class indices.
+
+      loss_color1 = CE(outputs['color1'], labels_color1)
+      loss_size1  = CE(outputs['size1'],  labels_size1)
+      loss_shape1 = CE(outputs['shape1'], labels_shape1)
+      loss_color2 = CE(outputs['color2'], labels_color2)
+      loss_size2  = CE(outputs['size2'],  labels_size2)
+      loss_shape2 = CE(outputs['shape2'], labels_shape2)
+      loss_rel    = CE(outputs['rel'],    labels_rel)
+
+      total_loss = (loss_color1 + loss_size1 + loss_shape1 +
+                    loss_color2 + loss_size2 + loss_shape2 +
+                    loss_rel) / 7.0
+
+      return total_loss, outputs, Z
+
+During training:
+- Backprop from total_loss all the way through:
+    ImagePropertyHead -> ImageBottleneck -> TextEncoder
+- This forces the encoder and bottleneck to shape Z so that a small CNN can recover the object properties.
+
+
+4. Notes and Suggestions
+------------------------
+
+- The config file for the encoder should allow the specification of
+  the size of the latent using two parameters, N and C, where the
+  latent is an NxN grid with C channels where C will be either 1 for
+  grayscale or 3 for RGB
+- You can save Z as images (after normalizing) during training to visually inspect whether different sentences produce distinguishable latent images.
+- At this stage, global pooling means the head uses Z as a bag-of-features; this is fine as a first check that the bottleneck is functional.
+- Once this works well, you can:
+  - Make the bottleneck more structured (e.g., via grid queries and cross-attention from the text).
+  - Design heads that exploit spatial structure more explicitly (e.g., separate pooling for different image regions, object heatmaps, etc.).
+
+The primary purpose of this step is:
+- Verify that the model can no longer 'cheat' by going directly from text to labels.
+- Confirm that semantic information about colors, sizes, shapes, and relations can be encoded in an RGB latent image that a small CNN can decode.

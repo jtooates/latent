@@ -1,0 +1,15 @@
+{
+    "n": 1000,
+    "p_one": 0.3,
+    "p_color": 0.5,
+    "p_size": 0.5,
+    "colors": ["red", "blue", "green"],
+    "sizes": ["small", "medium", "large"],
+    "shapes": ["circle", "square", "triangle"],
+    "rels": ["on", "above", "and", "beside"],
+    "latent_size": 32,
+    "latent_channels": 3,
+    "learning_rate": 0.001,
+    "use_maxpool": false,
+    "pool_size": 2
+}

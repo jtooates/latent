@@ -1,0 +1,292 @@
+Simple Text Encoder Specification for Object-Property Sentences
+==============================================================
+
+Goal
+----
+Build a small neural encoder that takes short synthetic sentences like:
+
+  1. large blue circle on blue square
+  2. blue square
+  3. large blue square above green triangle
+  4. square and medium circle
+  5. blue circle and green square
+  6. red circle on red triangle
+  7. square beside medium blue circle
+  8. triangle beside small blue triangle
+  9. circle beside medium green square
+  10. blue square on square
+
+and maps each sentence to a single dense latent vector.
+
+This latent will later be used to predict semantic properties:
+- Object 1: color, size, shape (or "not mentioned")
+- Object 2: color, size, shape (or "not mentioned")
+- Relationship between objects (or "not mentioned")
+
+For now, we only need:
+- A text encoder: sentence -> latent vector
+- A small classification head: latent -> property predictions
+
+
+Data and Tokenization
+---------------------
+The synthetic language has a small, closed vocabulary. Example token types:
+
+- Shapes: circle, square, triangle
+- Colors: red, green, blue
+- Sizes: small, medium, large
+- Relations: on, above, beside
+- Glue/other: and, a, the (if used), maybe "PAD", "CLS", "UNK"
+
+The vocabulary can be obtained from a config file that specifies how
+sentences are to be generated.
+
+1. Build a vocabulary mapping from string tokens to integer ids.
+   Example:
+     {
+       "[PAD]": 0,
+       "[CLS]": 1,
+       "small": 2,
+       "medium": 3,
+       "large": 4,
+       "red": 5,
+       "green": 6,
+       "blue": 7,
+       "circle": 8,
+       "square": 9,
+       "triangle": 10,
+       "on": 11,
+       "above": 12,
+       "beside": 13,
+       "and": 14
+       ...
+     }
+
+2. Tokenization:
+   - Prepend a [CLS] token to every sentence.
+   - Split the sentence on spaces (you can keep it simple).
+   - Map each token string to its id using the vocab.
+   - Pad sequences to a fixed max length with [PAD] tokens.
+
+   Example:
+     Sentence: "large blue circle on blue square"
+     Tokens:   ["[CLS]", "large", "blue", "circle", "on", "blue", "square"]
+     IDs:      [1,       4,       7,     8,        11,  7,      9, 0, 0, ...]
+
+   Use an attention mask to distinguish real tokens vs PAD:
+     - 1 for real tokens, 0 for PAD.
+
+
+Model Overview
+--------------
+The encoder is a small Transformer-based encoder:
+
+  token ids -> embeddings + positional encodings
+            -> 2-layer TransformerEncoder
+            -> take [CLS] hidden state as latent vector
+
+Then a simple MLP head maps the latent to predictions of:
+- Object 1 color / size / shape
+- Object 2 color / size / shape
+- Relationship
+
+All trained end-to-end with cross-entropy losses.
+
+
+Hyperparameters (suggested)
+---------------------------
+- d_model (embedding + hidden size): 128
+- num_layers (transformer encoder blocks): 2
+- num_heads (attention heads): 4
+- ff_dim (feedforward hidden size): 256
+- max_len (max token length): ~8–12 (enough for these sentences)
+
+
+Encoder Architecture Details
+----------------------------
+
+1. Embedding and positional encoding
+
+Use two embedding layers:
+
+- token_emb: nn.Embedding(num_tokens, d_model)
+- pos_emb:   nn.Embedding(max_len, d_model)
+
+For a batch of token_ids of shape [batch_size, seq_len]:
+- positions = [0, 1, ..., seq_len-1]
+- x = token_emb(token_ids) + pos_emb(positions)
+
+So x has shape [batch_size, seq_len, d_model].
+
+
+2. Transformer encoder
+
+Use PyTorch's TransformerEncoder:
+
+  encoder_layer = nn.TransformerEncoderLayer(
+      d_model=d_model,
+      nhead=nhead,
+      dim_feedforward=ff_dim,
+      batch_first=True,
+  )
+  encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+The encoder takes x and an optional src_key_padding_mask to ignore PAD tokens.
+
+Construct src_key_padding_mask from the attention mask:
+  - attn_mask: 1 for real tokens, 0 for PAD
+  - src_key_padding_mask = (attn_mask == 0)  # True where we want to ignore
+
+
+3. Latent vector extraction
+
+We treat the [CLS] token as a special summary token.
+
+If h is the encoder output of shape [batch_size, seq_len, d_model],
+then the sentence latent is:
+
+  latent = h[:, 0, :]  # [CLS] position
+
+
+PyTorch-Like Skeleton Code
+--------------------------
+
+This is a sketch of the encoder module (not a full runnable script):
+
+  import torch
+  import torch.nn as nn
+
+  class SimpleTextEncoder(nn.Module):
+      def __init__(self, num_tokens, max_len,
+                   d_model=128, nhead=4, ff_dim=256, num_layers=2):
+          super().__init__()
+          self.token_emb = nn.Embedding(num_tokens, d_model)
+          self.pos_emb   = nn.Embedding(max_len, d_model)
+
+          encoder_layer = nn.TransformerEncoderLayer(
+              d_model=d_model,
+              nhead=nhead,
+              dim_feedforward=ff_dim,
+              batch_first=True,
+          )
+          self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+      def forward(self, token_ids, attn_mask=None):
+          '''
+          token_ids: [batch, seq_len] (includes a [CLS] token at position 0)
+          attn_mask: optional [batch, seq_len] (1 for real tokens, 0 for PAD)
+          '''
+          batch_size, seq_len = token_ids.shape
+          device = token_ids.device
+
+          positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+
+          x = self.token_emb(token_ids) + self.pos_emb(positions)  # [B, L, d_model]
+
+          src_key_padding_mask = None
+          if attn_mask is not None:
+              # TransformerEncoder expects True for PAD tokens
+              src_key_padding_mask = (attn_mask == 0)  # [B, L], bool
+
+          h = self.encoder(x, src_key_padding_mask=src_key_padding_mask)  # [B, L, d_model]
+
+          # Use CLS token representation as latent
+          latent = h[:, 0, :]   # [B, d_model]
+          return latent
+
+
+Property Prediction Head
+------------------------
+
+We want to predict properties for up to two objects plus the relationship.
+Each property is a small multi-class classification problem.
+
+Define the label spaces (example):
+- Colors: {red, green, blue, NOT_MENTIONED}         -> n_colors = 4
+- Sizes:  {small, medium, large, NOT_MENTIONED}     -> n_sizes  = 4
+- Shapes: {circle, square, triangle, NOT_MENTIONED} -> n_shapes = 4
+- Relations: {on, above, beside, NOT_MENTIONED}     -> n_rels   = 4
+
+We create a simple MLP head:
+
+  class PropertyHead(nn.Module):
+      def __init__(self, d_model, n_colors, n_sizes, n_shapes, n_rels):
+          super().__init__()
+          hidden = 128
+          self.mlp = nn.Sequential(
+              nn.Linear(d_model, hidden),
+              nn.ReLU(),
+          )
+          # Object 1
+          self.color1 = nn.Linear(hidden, n_colors)
+          self.size1  = nn.Linear(hidden, n_sizes)
+          self.shape1 = nn.Linear(hidden, n_shapes)
+          # Object 2
+          self.color2 = nn.Linear(hidden, n_colors)
+          self.size2  = nn.Linear(hidden, n_sizes)
+          self.shape2 = nn.Linear(hidden, n_shapes)
+          # Relationship between objects
+          self.rel    = nn.Linear(hidden, n_rels)
+
+      def forward(self, latent):
+          h = self.mlp(latent)
+          return {
+              "color1": self.color1(h),  # logits
+              "size1":  self.size1(h),
+              "shape1": self.shape1(h),
+              "color2": self.color2(h),
+              "size2":  self.size2(h),
+              "shape2": self.shape2(h),
+              "rel":    self.rel(h),
+          }
+
+
+Training Objective
+------------------
+
+Given:
+- token_ids: [B, L]
+- attn_mask: [B, L]
+- labels for each property:
+  - color1, size1, shape1, color2, size2, shape2, rel
+  Each label is an integer class index (0..C-1).
+
+Steps:
+
+1. Encode sentences:
+   latent = encoder(token_ids, attn_mask)  # [B, d_model]
+
+2. Get logits for each property:
+   outputs = head(latent)
+
+3. Compute cross-entropy loss for each property:
+   loss_color1 = CE(outputs["color1"], labels_color1)
+   loss_size1  = CE(outputs["size1"],  labels_size1)
+   loss_shape1 = CE(outputs["shape1"], labels_shape1)
+   loss_color2 = CE(outputs["color2"], labels_color2)
+   loss_size2  = CE(outputs["size2"],  labels_size2)
+   loss_shape2 = CE(outputs["shape2"], labels_shape2)
+   loss_rel    = CE(outputs["rel"],    labels_rel)
+
+4. Total loss is sum or mean of all property losses:
+   total_loss = (loss_color1 + loss_size1 + loss_shape1 +
+                 loss_color2 + loss_size2 + loss_shape2 +
+                 loss_rel) / 7.0
+
+5. Backprop on total_loss and update both the encoder and the head.
+
+
+Notes for the Coding Assistant
+------------------------------
+
+- Implement the vocab, tokenization, and data loader for the synthetic sentences.
+- Implement the SimpleTextEncoder and PropertyHead as described.
+- Train end-to-end on generated data until the property prediction accuracy is high.
+- Once this works well, the same encoder backbone can later be extended to:
+  - produce a 2D image-like latent instead of a single vector,
+  - serve as the text side of a seq-to-seq model with an image bottleneck.
+
+The main goal of this stage is:
+- Verify that the text encoder can learn a meaningful sentence-level latent
+  that captures discrete attributes (color, size, shape, relation) from
+  sentences in the synthetic language.
