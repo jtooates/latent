@@ -442,7 +442,8 @@ class FullModelWithBottleneck(nn.Module):
         self,
         token_ids: torch.Tensor,
         attn_mask: torch.Tensor = None,
-        return_latent_image: bool = False
+        return_latent_image: bool = False,
+        noise_stddev: float = 0.0
     ):
         """Forward pass through encoder, reshape, and property head.
 
@@ -450,6 +451,8 @@ class FullModelWithBottleneck(nn.Module):
             token_ids: [batch_size, seq_len] Token IDs.
             attn_mask: [batch_size, seq_len] Attention mask.
             return_latent_image: If True, return (outputs, Z). Otherwise just outputs.
+            noise_stddev: Standard deviation of Gaussian noise to add to latent image.
+                         Only applied during training if > 0.
 
         Returns:
             If return_latent_image is False:
@@ -464,10 +467,18 @@ class FullModelWithBottleneck(nn.Module):
         B = latent_vec.size(0)
         Z = latent_vec.view(B, self.latent_channels, self.latent_size, self.latent_size)  # [B, C, N, N]
 
-        # 3. Predict properties from image
-        outputs = self.head(Z)
+        # 3. Add Gaussian noise during training (for regularization)
+        if self.training and noise_stddev > 0:
+            noise = torch.randn_like(Z) * noise_stddev
+            Z_noisy = Z + noise
+        else:
+            Z_noisy = Z
+
+        # 4. Predict properties from image
+        outputs = self.head(Z_noisy)
 
         if return_latent_image:
+            # Return clean latent image (without noise) for visualization
             return outputs, Z
         else:
             return outputs

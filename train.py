@@ -109,7 +109,7 @@ def compute_accuracy(outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Te
     return accuracies
 
 
-def train_epoch(model, train_loader, optimizer, device, coherence_weight: float = 0.0) -> Dict[str, float]:
+def train_epoch(model, train_loader, optimizer, device, coherence_weight: float = 0.0, noise_stddev: float = 0.0) -> Dict[str, float]:
     """Train for one epoch.
 
     Args:
@@ -118,6 +118,7 @@ def train_epoch(model, train_loader, optimizer, device, coherence_weight: float 
         optimizer: Optimizer.
         device: Device to train on.
         coherence_weight: Weight for gradient coherence loss (only applies to bottleneck models).
+        noise_stddev: Standard deviation of Gaussian noise to add to latent (only applies to bottleneck models).
 
     Returns:
         Dictionary with average loss, coherence loss, and accuracies.
@@ -140,9 +141,12 @@ def train_epoch(model, train_loader, optimizer, device, coherence_weight: float 
         # Forward pass
         if use_coherence:
             # Need to get latent image for coherence loss
-            outputs, Z = model(token_ids, attn_mask, return_latent_image=True)
+            outputs, Z = model(token_ids, attn_mask, return_latent_image=True, noise_stddev=noise_stddev)
         else:
-            outputs = model(token_ids, attn_mask)
+            if isinstance(model, FullModelWithBottleneck):
+                outputs = model(token_ids, attn_mask, noise_stddev=noise_stddev)
+            else:
+                outputs = model(token_ids, attn_mask)
             # Handle tuple return from FullModelWithBottleneck without explicit return_latent_image
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
@@ -304,6 +308,7 @@ def main():
     parser.add_argument('--save-images-every', type=int, default=10, help='Save latent images every N epochs')
     parser.add_argument('--image-output-dir', type=str, default='latent_images', help='Directory for saving latent images')
     parser.add_argument('--coherence-weight', type=float, default=None, help='Weight for gradient coherence loss (overrides config)')
+    parser.add_argument('--latent-noise', type=float, default=None, help='Stddev of Gaussian noise to add to latent (overrides config)')
 
     args = parser.parse_args()
 
@@ -450,6 +455,15 @@ def main():
         if coherence_weight > 0:
             print(f"  Using coherence loss weight from config: {coherence_weight}")
 
+    # Determine latent noise stddev (command-line overrides config)
+    if args.latent_noise is not None:
+        latent_noise_stddev = args.latent_noise
+        print(f"  Using latent noise stddev from command-line: {latent_noise_stddev}")
+    else:
+        latent_noise_stddev = config.get('latent_noise_stddev', 0.0)  # Default to 0.0 if not in config
+        if latent_noise_stddev > 0:
+            print(f"  Using latent noise stddev from config: {latent_noise_stddev}")
+
     # Training loop
     print(f"\nTraining on {args.device} for {args.epochs} epochs...\n")
     best_val_loss = float('inf')
@@ -461,7 +475,7 @@ def main():
 
     for epoch in range(args.epochs):
         # Train
-        train_metrics = train_epoch(model, train_loader, optimizer, args.device, coherence_weight)
+        train_metrics = train_epoch(model, train_loader, optimizer, args.device, coherence_weight, latent_noise_stddev)
 
         # Validate
         val_metrics = validate(model, val_loader, args.device)
@@ -501,6 +515,7 @@ def main():
                 'use_maxpool': use_maxpool if args.use_bottleneck else None,
                 'pool_size': pool_size if args.use_bottleneck else None,
                 'coherence_loss_weight': coherence_weight,
+                'latent_noise_stddev': latent_noise_stddev,
             }
             torch.save(checkpoint, output_dir / 'best_model.pt')
             print(f"  → Saved best model (val_loss={best_val_loss:.4f})")
