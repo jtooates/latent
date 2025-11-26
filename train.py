@@ -39,6 +39,54 @@ def compute_loss(outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor
     return total_loss
 
 
+def compute_gradient_coherence_loss(Z: torch.Tensor) -> torch.Tensor:
+    """Compute gradient coherence loss to encourage similar edges across RGB channels.
+
+    This loss penalizes differences in spatial gradients between channel pairs,
+    encouraging edges and features to appear at the same locations in all channels.
+
+    Args:
+        Z: Latent image tensor [batch_size, channels, height, width].
+           Assumes channels=3 for RGB.
+
+    Returns:
+        Scalar coherence loss value.
+    """
+    if Z.size(1) != 3:
+        # Only applies to 3-channel (RGB) latents
+        return torch.tensor(0.0, device=Z.device)
+
+    # Extract individual channels
+    R = Z[:, 0]  # [B, H, W]
+    G = Z[:, 1]
+    B = Z[:, 2]
+
+    # Compute horizontal gradients (x direction)
+    grad_x_R = R[:, :, 1:] - R[:, :, :-1]  # [B, H, W-1]
+    grad_x_G = G[:, :, 1:] - G[:, :, :-1]
+    grad_x_B = B[:, :, 1:] - B[:, :, :-1]
+
+    # Compute vertical gradients (y direction)
+    grad_y_R = R[:, 1:, :] - R[:, :-1, :]  # [B, H-1, W]
+    grad_y_G = G[:, 1:, :] - G[:, :-1, :]
+    grad_y_B = B[:, 1:, :] - B[:, :-1, :]
+
+    # Compute pairwise gradient differences (horizontal)
+    diff_x_RG = (grad_x_R - grad_x_G).abs().mean()
+    diff_x_RB = (grad_x_R - grad_x_B).abs().mean()
+    diff_x_GB = (grad_x_G - grad_x_B).abs().mean()
+
+    # Compute pairwise gradient differences (vertical)
+    diff_y_RG = (grad_y_R - grad_y_G).abs().mean()
+    diff_y_RB = (grad_y_R - grad_y_B).abs().mean()
+    diff_y_GB = (grad_y_G - grad_y_B).abs().mean()
+
+    # Total coherence loss (average of all pairwise differences)
+    coherence_loss = (diff_x_RG + diff_x_RB + diff_x_GB + diff_y_RG + diff_y_RB + diff_y_GB) / 6.0
+
+    return coherence_loss
+
+
 def compute_accuracy(outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
     """Compute per-property accuracy.
 
@@ -61,7 +109,7 @@ def compute_accuracy(outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Te
     return accuracies
 
 
-def train_epoch(model, train_loader, optimizer, device) -> Dict[str, float]:
+def train_epoch(model, train_loader, optimizer, device, coherence_weight: float = 0.0) -> Dict[str, float]:
     """Train for one epoch.
 
     Args:
@@ -69,14 +117,19 @@ def train_epoch(model, train_loader, optimizer, device) -> Dict[str, float]:
         train_loader: DataLoader for training data.
         optimizer: Optimizer.
         device: Device to train on.
+        coherence_weight: Weight for gradient coherence loss (only applies to bottleneck models).
 
     Returns:
-        Dictionary with average loss and accuracies.
+        Dictionary with average loss, coherence loss, and accuracies.
     """
     model.train()
     total_loss = 0.0
+    total_classification_loss = 0.0
+    total_coherence_loss = 0.0
     total_accs = {prop: 0.0 for prop in ['color1', 'size1', 'shape1', 'color2', 'size2', 'shape2', 'rel']}
     num_batches = 0
+
+    use_coherence = isinstance(model, FullModelWithBottleneck) and coherence_weight > 0
 
     for batch in train_loader:
         # Move to device
@@ -84,15 +137,26 @@ def train_epoch(model, train_loader, optimizer, device) -> Dict[str, float]:
         attn_mask = batch['attn_mask'].to(device)
         labels = {k: v.to(device) for k, v in batch.items() if k not in ['token_ids', 'attn_mask']}
 
-        # Forward pass (works for both FullModel and FullModelWithBottleneck)
-        outputs = model(token_ids, attn_mask)
+        # Forward pass
+        if use_coherence:
+            # Need to get latent image for coherence loss
+            outputs, Z = model(token_ids, attn_mask, return_latent_image=True)
+        else:
+            outputs = model(token_ids, attn_mask)
+            # Handle tuple return from FullModelWithBottleneck without explicit return_latent_image
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
 
-        # Handle tuple return from FullModelWithBottleneck
-        if isinstance(outputs, tuple):
-            outputs = outputs[0]  # outputs, Z
+        # Compute classification loss
+        classification_loss = compute_loss(outputs, labels)
 
-        # Compute loss
-        loss = compute_loss(outputs, labels)
+        # Compute coherence loss if applicable
+        if use_coherence:
+            coherence_loss = compute_gradient_coherence_loss(Z)
+            loss = classification_loss + coherence_weight * coherence_loss
+            total_coherence_loss += coherence_loss.item()
+        else:
+            loss = classification_loss
 
         # Backward pass
         optimizer.zero_grad()
@@ -101,6 +165,7 @@ def train_epoch(model, train_loader, optimizer, device) -> Dict[str, float]:
 
         # Track metrics
         total_loss += loss.item()
+        total_classification_loss += classification_loss.item()
         accs = compute_accuracy(outputs, labels)
         for prop, acc in accs.items():
             total_accs[prop] += acc
@@ -108,9 +173,16 @@ def train_epoch(model, train_loader, optimizer, device) -> Dict[str, float]:
 
     # Average metrics
     avg_loss = total_loss / num_batches
+    avg_classification_loss = total_classification_loss / num_batches
+    avg_coherence_loss = total_coherence_loss / num_batches if use_coherence else 0.0
     avg_accs = {prop: total_accs[prop] / num_batches for prop in total_accs}
 
-    return {'loss': avg_loss, **avg_accs}
+    return {
+        'loss': avg_loss,
+        'classification_loss': avg_classification_loss,
+        'coherence_loss': avg_coherence_loss,
+        **avg_accs
+    }
 
 
 def save_sample_latent_images(
@@ -231,6 +303,7 @@ def main():
     parser.add_argument('--latent-channels', type=int, default=None, help='Number of channels in latent image (1 or 3, overrides config)')
     parser.add_argument('--save-images-every', type=int, default=10, help='Save latent images every N epochs')
     parser.add_argument('--image-output-dir', type=str, default='latent_images', help='Directory for saving latent images')
+    parser.add_argument('--coherence-weight', type=float, default=None, help='Weight for gradient coherence loss (overrides config)')
 
     args = parser.parse_args()
 
@@ -368,6 +441,15 @@ def main():
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
+    # Determine coherence loss weight (command-line overrides config)
+    if args.coherence_weight is not None:
+        coherence_weight = args.coherence_weight
+        print(f"  Using coherence loss weight from command-line: {coherence_weight}")
+    else:
+        coherence_weight = config.get('coherence_loss_weight', 0.0)  # Default to 0.0 if not in config
+        if coherence_weight > 0:
+            print(f"  Using coherence loss weight from config: {coherence_weight}")
+
     # Training loop
     print(f"\nTraining on {args.device} for {args.epochs} epochs...\n")
     best_val_loss = float('inf')
@@ -379,14 +461,18 @@ def main():
 
     for epoch in range(args.epochs):
         # Train
-        train_metrics = train_epoch(model, train_loader, optimizer, args.device)
+        train_metrics = train_epoch(model, train_loader, optimizer, args.device, coherence_weight)
 
         # Validate
         val_metrics = validate(model, val_loader, args.device)
 
         # Print metrics
         print(f"Epoch {epoch + 1}/{args.epochs}")
-        print(f"  Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_metrics['loss']:.4f}")
+        if coherence_weight > 0:
+            print(f"  Train Loss: {train_metrics['loss']:.4f} (class: {train_metrics['classification_loss']:.4f}, "
+                  f"coherence: {train_metrics['coherence_loss']:.4f}) | Val Loss: {val_metrics['loss']:.4f}")
+        else:
+            print(f"  Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_metrics['loss']:.4f}")
         print(f"  Train Acc: color1={train_metrics['color1']:.3f}, size1={train_metrics['size1']:.3f}, "
               f"shape1={train_metrics['shape1']:.3f}, color2={train_metrics['color2']:.3f}, "
               f"size2={train_metrics['size2']:.3f}, shape2={train_metrics['shape2']:.3f}, rel={train_metrics['rel']:.3f}")
@@ -414,6 +500,7 @@ def main():
                 'latent_channels': latent_channels if args.use_bottleneck else None,
                 'use_maxpool': use_maxpool if args.use_bottleneck else None,
                 'pool_size': pool_size if args.use_bottleneck else None,
+                'coherence_loss_weight': coherence_weight,
             }
             torch.save(checkpoint, output_dir / 'best_model.pt')
             print(f"  → Saved best model (val_loss={best_val_loss:.4f})")

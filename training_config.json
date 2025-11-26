@@ -11,5 +11,6 @@
     "latent_channels": 3,
     "learning_rate": 0.001,
     "use_maxpool": true,
-    "pool_size": 2
+    "pool_size": 2,
+    "coherence_loss_weight": 0.1
 }
