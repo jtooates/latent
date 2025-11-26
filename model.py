@@ -11,7 +11,8 @@ class SimpleTextEncoder(nn.Module):
     Architecture:
         token ids -> embeddings + positional encodings
                   -> 2-layer TransformerEncoder
-                  -> [CLS] hidden state as latent vector
+                  -> [CLS] hidden state
+                  -> optional projection to match latent image size
     """
 
     def __init__(
@@ -22,7 +23,8 @@ class SimpleTextEncoder(nn.Module):
         nhead: int = 4,
         ff_dim: int = 256,
         num_layers: int = 2,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        latent_dim: int = None
     ):
         """Initialize the text encoder.
 
@@ -34,10 +36,13 @@ class SimpleTextEncoder(nn.Module):
             ff_dim: Feedforward hidden dimension.
             num_layers: Number of transformer encoder layers.
             dropout: Dropout probability.
+            latent_dim: Output latent dimension. If None, uses d_model.
+                       For bottleneck models, set to latent_size * latent_size * latent_channels.
         """
         super().__init__()
         self.d_model = d_model
         self.max_len = max_len
+        self.latent_dim = latent_dim if latent_dim is not None else d_model
 
         # Token and positional embeddings
         self.token_emb = nn.Embedding(num_tokens, d_model)
@@ -53,6 +58,12 @@ class SimpleTextEncoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
+        # Optional projection to match target latent dimension
+        if self.latent_dim != d_model:
+            self.projection = nn.Linear(d_model, self.latent_dim)
+        else:
+            self.projection = None
+
     def forward(self, token_ids: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
         """Encode token IDs to latent vector.
 
@@ -61,7 +72,7 @@ class SimpleTextEncoder(nn.Module):
             attn_mask: [batch_size, seq_len] Attention mask (1 for real tokens, 0 for PAD).
 
         Returns:
-            latent: [batch_size, d_model] Latent vector from [CLS] token.
+            latent: [batch_size, latent_dim] Latent vector from [CLS] token.
         """
         batch_size, seq_len = token_ids.shape
         device = token_ids.device
@@ -80,8 +91,12 @@ class SimpleTextEncoder(nn.Module):
         # Pass through transformer encoder
         h = self.encoder(x, src_key_padding_mask=src_key_padding_mask)  # [B, L, d_model]
 
-        # Extract [CLS] token representation as latent
+        # Extract [CLS] token representation
         latent = h[:, 0, :]  # [B, d_model]
+
+        # Project to target dimension if needed
+        if self.projection is not None:
+            latent = self.projection(latent)  # [B, latent_dim]
 
         return latent
 
@@ -383,12 +398,12 @@ class FullModel(nn.Module):
 
 
 class FullModelWithBottleneck(nn.Module):
-    """Combined encoder, image bottleneck, and CNN property head.
+    """Combined encoder and CNN property head with image bottleneck.
 
     Architecture:
-        sentence -> text encoder -> latent_vec
+        sentence -> text encoder -> latent_vec [B, C*N*N]
                                        ↓
-                                ImageBottleneck
+                                   reshape
                                        ↓
                             Z [B, C, N, N] (RGB latent image)
                                        ↓
@@ -398,25 +413,30 @@ class FullModelWithBottleneck(nn.Module):
 
     This architecture forces semantic information to pass through a spatial
     image-like bottleneck, preventing direct vector-to-label shortcuts.
+    The encoder directly outputs a vector of size (C*N*N) which is reshaped
+    to an image, with no intermediate projection MLP.
     """
 
     def __init__(
         self,
         encoder: SimpleTextEncoder,
-        bottleneck: ImageBottleneck,
-        head: ImagePropertyHead
+        head: ImagePropertyHead,
+        latent_size: int = 32,
+        latent_channels: int = 3
     ):
         """Initialize the full model with bottleneck.
 
         Args:
-            encoder: Text encoder that produces latent vectors.
-            bottleneck: Image bottleneck that maps vectors to images.
+            encoder: Text encoder that produces latent vectors of size (latent_channels * latent_size * latent_size).
             head: CNN-based property head that reads from images.
+            latent_size: Spatial size of latent image (N in N×N).
+            latent_channels: Number of channels in latent image (C).
         """
         super().__init__()
         self.encoder = encoder
-        self.bottleneck = bottleneck
         self.head = head
+        self.latent_size = latent_size
+        self.latent_channels = latent_channels
 
     def forward(
         self,
@@ -424,7 +444,7 @@ class FullModelWithBottleneck(nn.Module):
         attn_mask: torch.Tensor = None,
         return_latent_image: bool = False
     ):
-        """Forward pass through encoder, bottleneck, and property head.
+        """Forward pass through encoder, reshape, and property head.
 
         Args:
             token_ids: [batch_size, seq_len] Token IDs.
@@ -438,10 +458,11 @@ class FullModelWithBottleneck(nn.Module):
                 Tuple of (outputs dict, latent image Z).
         """
         # 1. Encode sentence to latent vector
-        latent_vec = self.encoder(token_ids, attn_mask)  # [B, d_model]
+        latent_vec = self.encoder(token_ids, attn_mask)  # [B, C*N*N]
 
-        # 2. Map to RGB latent image
-        Z = self.bottleneck(latent_vec)  # [B, C, N, N]
+        # 2. Reshape to RGB latent image (no projection MLP)
+        B = latent_vec.size(0)
+        Z = latent_vec.view(B, self.latent_channels, self.latent_size, self.latent_size)  # [B, C, N, N]
 
         # 3. Predict properties from image
         outputs = self.head(Z)

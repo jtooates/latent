@@ -10,6 +10,6 @@
     "latent_size": 32,
     "latent_channels": 3,
     "learning_rate": 0.001,
-    "use_maxpool": false,
+    "use_maxpool": true,
     "pool_size": 2
 }

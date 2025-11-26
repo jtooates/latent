@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from vocab import Vocabulary, Tokenizer
-from model import SimpleTextEncoder, PropertyHead, FullModel, ImageBottleneck, ImagePropertyHead, FullModelWithBottleneck
+from model import SimpleTextEncoder, PropertyHead, FullModel, ImagePropertyHead, FullModelWithBottleneck
 from dataset import PropertyEncoder
 from image_utils import save_latent_image
 
@@ -39,16 +39,6 @@ def load_model(checkpoint_path: str, vocab_path: str, device: str = 'cpu'):
         rels=config['rels']
     )
 
-    # Recreate encoder
-    encoder = SimpleTextEncoder(
-        num_tokens=len(vocab),
-        max_len=12,
-        d_model=128,
-        nhead=4,
-        ff_dim=256,
-        num_layers=2
-    )
-
     # Check if this is a bottleneck model
     use_bottleneck = checkpoint.get('use_bottleneck', False)
 
@@ -58,12 +48,18 @@ def load_model(checkpoint_path: str, vocab_path: str, device: str = 'cpu'):
         use_maxpool = checkpoint.get('use_maxpool', False)
         pool_size = checkpoint.get('pool_size', 2)
 
-        # Create bottleneck
-        bottleneck = ImageBottleneck(
+        # Calculate latent dimension
+        latent_dim = latent_channels * latent_size * latent_size
+
+        # Create encoder with latent_dim output
+        encoder = SimpleTextEncoder(
+            num_tokens=len(vocab),
+            max_len=12,
             d_model=128,
-            img_size=latent_size,
-            img_channels=latent_channels,
-            hidden_dim=256
+            nhead=4,
+            ff_dim=256,
+            num_layers=2,
+            latent_dim=latent_dim
         )
 
         # Create CNN-based head
@@ -79,8 +75,18 @@ def load_model(checkpoint_path: str, vocab_path: str, device: str = 'cpu'):
             pool_size=pool_size
         )
 
-        model = FullModelWithBottleneck(encoder, bottleneck, head)
+        model = FullModelWithBottleneck(encoder, head, latent_size, latent_channels)
     else:
+        # Create encoder with default d_model output
+        encoder = SimpleTextEncoder(
+            num_tokens=len(vocab),
+            max_len=12,
+            d_model=128,
+            nhead=4,
+            ff_dim=256,
+            num_layers=2
+        )
+
         # Create MLP-based head
         head = PropertyHead(
             d_model=128,
@@ -98,7 +104,7 @@ def load_model(checkpoint_path: str, vocab_path: str, device: str = 'cpu'):
             dummy_tokens = torch.zeros(1, 12, dtype=torch.long).to(device)
             dummy_mask = torch.ones(1, 12, dtype=torch.long).to(device)
             dummy_latent_vec = model.encoder(dummy_tokens, dummy_mask)
-            dummy_latent_img = model.bottleneck(dummy_latent_vec)
+            dummy_latent_img = dummy_latent_vec.view(1, latent_channels, latent_size, latent_size)
             _ = model.head(dummy_latent_img)  # This initializes the MLP
 
     model.load_state_dict(checkpoint['model_state_dict'])

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict
 
 from vocab import build_vocab_from_config, Tokenizer, Vocabulary
-from model import SimpleTextEncoder, PropertyHead, FullModel, ImageBottleneck, ImagePropertyHead, FullModelWithBottleneck
+from model import SimpleTextEncoder, PropertyHead, FullModel, ImagePropertyHead, FullModelWithBottleneck
 from dataset import PropertyEncoder, create_dataloaders
 from image_utils import save_latent_images
 from scene_generator import scene_to_sentence
@@ -273,14 +273,6 @@ def main():
 
     # Create model
     print("Creating model...")
-    encoder = SimpleTextEncoder(
-        num_tokens=len(vocab),
-        max_len=12,
-        d_model=128,
-        nhead=4,
-        ff_dim=256,
-        num_layers=2
-    )
 
     if args.use_bottleneck:
         # Determine latent size (command-line overrides config)
@@ -301,12 +293,19 @@ def main():
 
         print(f"  Image bottleneck: {latent_channels}x{latent_size}x{latent_size}")
 
-        # Create image bottleneck
-        bottleneck = ImageBottleneck(
+        # Calculate latent dimension (encoder output = latent image flattened)
+        latent_dim = latent_channels * latent_size * latent_size
+        print(f"  Encoder output dimension: {latent_dim} (will be reshaped to image)")
+
+        # Create encoder with latent_dim output
+        encoder = SimpleTextEncoder(
+            num_tokens=len(vocab),
+            max_len=12,
             d_model=128,
-            img_size=latent_size,
-            img_channels=latent_channels,
-            hidden_dim=256
+            nhead=4,
+            ff_dim=256,
+            num_layers=2,
+            latent_dim=latent_dim
         )
 
         # Get pooling configuration from config
@@ -331,9 +330,19 @@ def main():
             pool_size=pool_size
         )
 
-        model = FullModelWithBottleneck(encoder, bottleneck, head)
+        model = FullModelWithBottleneck(encoder, head, latent_size, latent_channels)
     else:
         print("  Using direct vector-to-labels architecture")
+
+        # Create encoder with default d_model output
+        encoder = SimpleTextEncoder(
+            num_tokens=len(vocab),
+            max_len=12,
+            d_model=128,
+            nhead=4,
+            ff_dim=256,
+            num_layers=2
+        )
 
         # Create MLP-based property head
         head = PropertyHead(
