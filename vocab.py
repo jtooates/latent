@@ -107,6 +107,34 @@ def build_vocab_from_config(config_path: str) -> Vocabulary:
     return vocab
 
 
+def build_vocab_from_data(data_path: str) -> Vocabulary:
+    """Build vocabulary from data file metadata.
+
+    Args:
+        data_path: Path to JSON data file with metadata section.
+
+    Returns:
+        Vocabulary object with all tokens from metadata.
+    """
+    with open(data_path, 'r') as f:
+        data = json.load(f)
+
+    if 'metadata' not in data:
+        raise ValueError(f"Data file {data_path} is missing 'metadata' section. "
+                        "Please regenerate the data file with metadata included.")
+
+    metadata = data['metadata']
+    vocab = Vocabulary()
+
+    # Add all tokens from metadata
+    vocab.add_tokens(metadata.get('colors', []))
+    vocab.add_tokens(metadata.get('sizes', []))
+    vocab.add_tokens(metadata.get('shapes', []))
+    vocab.add_tokens(metadata.get('rels', []))
+
+    return vocab
+
+
 class Tokenizer:
     """Tokenizes sentences into token IDs with attention masks."""
 

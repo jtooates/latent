@@ -170,22 +170,37 @@ class SceneDataset(Dataset):
 def create_dataloaders(
     scenes_path: str,
     tokenizer: Tokenizer,
-    property_encoder: PropertyEncoder,
     batch_size: int = 32,
     train_split: float = 0.8
-) -> Tuple[DataLoader, DataLoader]:
+) -> Tuple[DataLoader, DataLoader, PropertyEncoder]:
     """Create train and validation dataloaders.
 
     Args:
         scenes_path: Path to scenes JSON file.
         tokenizer: Tokenizer instance.
-        property_encoder: PropertyEncoder instance.
         batch_size: Batch size.
         train_split: Fraction of data for training.
 
     Returns:
-        Tuple of (train_loader, val_loader).
+        Tuple of (train_loader, val_loader, property_encoder).
     """
+    # Load metadata from data file
+    with open(scenes_path, 'r') as f:
+        data = json.load(f)
+
+    # Create PropertyEncoder from metadata
+    if 'metadata' in data:
+        metadata = data['metadata']
+        property_encoder = PropertyEncoder(
+            colors=metadata['colors'],
+            sizes=metadata['sizes'],
+            shapes=metadata['shapes'],
+            rels=metadata['rels']
+        )
+    else:
+        raise ValueError(f"Data file {scenes_path} is missing 'metadata' section. "
+                        "Please regenerate the data file with metadata included.")
+
     dataset = SceneDataset(scenes_path, tokenizer, property_encoder)
 
     # Split into train and validation
@@ -212,4 +227,4 @@ def create_dataloaders(
         drop_last=False
     )
 
-    return train_loader, val_loader
+    return train_loader, val_loader, property_encoder

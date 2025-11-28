@@ -133,18 +133,27 @@ def _generate_object(config: Dict[str, Any]) -> SceneObject:
     return SceneObject(shape=shape, color=color, size=size)
 
 
-def scenes_to_json(scenes: List[Scene]) -> str:
+def scenes_to_json(scenes: List[Scene], config: Optional[Dict[str, Any]] = None) -> str:
     """Convert list of scenes to JSON string.
 
     Args:
         scenes: List of Scene objects.
+        config: Optional configuration dict to include metadata (colors, sizes, shapes, rels).
 
     Returns:
-        JSON string representation of scenes.
+        JSON string representation of scenes with optional metadata.
     """
-    data = {
-        "scenes": [scene.to_dict() for scene in scenes]
-    }
+    data = {"scenes": [scene.to_dict() for scene in scenes]}
+
+    # Add metadata if config is provided
+    if config is not None:
+        data["metadata"] = {
+            "colors": config.get("colors", []),
+            "sizes": config.get("sizes", []),
+            "shapes": config.get("shapes", []),
+            "rels": config.get("rels", [])
+        }
+
     return json.dumps(data, indent=2)
 
 

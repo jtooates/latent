@@ -9,7 +9,7 @@ import torch.optim as optim
 from pathlib import Path
 from typing import Dict
 
-from vocab import build_vocab_from_config, Tokenizer, Vocabulary
+from vocab import build_vocab_from_data, Tokenizer, Vocabulary
 from model import SimpleTextEncoder, PropertyHead, FullModel, ImagePropertyHead, FullModelWithBottleneck
 from dataset import PropertyEncoder, create_dataloaders
 from image_utils import save_latent_images
@@ -109,7 +109,7 @@ def compute_accuracy(outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Te
     return accuracies
 
 
-def train_epoch(model, train_loader, optimizer, device, coherence_weight: float = 0.0, noise_stddev: float = 0.0) -> Dict[str, float]:
+def train_epoch(model, train_loader, optimizer, device, classification_weight: float = 1.0, coherence_weight: float = 0.0, noise_stddev: float = 0.0) -> Dict[str, float]:
     """Train for one epoch.
 
     Args:
@@ -117,6 +117,7 @@ def train_epoch(model, train_loader, optimizer, device, coherence_weight: float 
         train_loader: DataLoader for training data.
         optimizer: Optimizer.
         device: Device to train on.
+        classification_weight: Weight for classification loss.
         coherence_weight: Weight for gradient coherence loss (only applies to bottleneck models).
         noise_stddev: Standard deviation of Gaussian noise to add to latent (only applies to bottleneck models).
 
@@ -157,10 +158,10 @@ def train_epoch(model, train_loader, optimizer, device, coherence_weight: float 
         # Compute coherence loss if applicable
         if use_coherence:
             coherence_loss = compute_gradient_coherence_loss(Z)
-            loss = classification_loss + coherence_weight * coherence_loss
+            loss = classification_weight * classification_loss + coherence_weight * coherence_loss
             total_coherence_loss += coherence_loss.item()
         else:
-            loss = classification_loss
+            loss = classification_weight * classification_loss
 
         # Backward pass
         optimizer.zero_grad()
@@ -307,6 +308,7 @@ def main():
     parser.add_argument('--latent-channels', type=int, default=None, help='Number of channels in latent image (1 or 3, overrides config)')
     parser.add_argument('--save-images-every', type=int, default=10, help='Save latent images every N epochs')
     parser.add_argument('--image-output-dir', type=str, default='latent_images', help='Directory for saving latent images')
+    parser.add_argument('--classification-weight', type=float, default=None, help='Weight for classification loss (overrides config)')
     parser.add_argument('--coherence-weight', type=float, default=None, help='Weight for gradient coherence loss (overrides config)')
     parser.add_argument('--latent-noise', type=float, default=None, help='Stddev of Gaussian noise to add to latent (overrides config)')
 
@@ -320,9 +322,9 @@ def main():
     with open(args.config, 'r') as f:
         config = json.load(f)
 
-    # Build vocabulary
-    print("Building vocabulary...")
-    vocab = build_vocab_from_config(args.config)
+    # Build vocabulary from data file metadata
+    print("Building vocabulary from data file metadata...")
+    vocab = build_vocab_from_data(args.data)
     print(f"Vocabulary size: {len(vocab)}")
 
     # Save vocabulary
@@ -331,23 +333,17 @@ def main():
     # Create tokenizer
     tokenizer = Tokenizer(vocab, max_len=12)
 
-    # Create property encoder
-    property_encoder = PropertyEncoder(
-        colors=config['colors'],
-        sizes=config['sizes'],
-        shapes=config['shapes'],
-        rels=config['rels']
-    )
-
-    # Create dataloaders
+    # Create dataloaders (PropertyEncoder is created from data file metadata)
     print("Loading data...")
-    train_loader, val_loader = create_dataloaders(
+    train_loader, val_loader, property_encoder = create_dataloaders(
         args.data,
         tokenizer,
-        property_encoder,
         batch_size=args.batch_size
     )
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+    print(f"PropertyEncoder loaded from data metadata: {property_encoder.n_colors} colors, "
+          f"{property_encoder.n_sizes} sizes, {property_encoder.n_shapes} shapes, "
+          f"{property_encoder.n_rels} relationships")
 
     # Create model
     print("Creating model...")
@@ -446,6 +442,15 @@ def main():
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
+    # Determine classification loss weight (command-line overrides config)
+    if args.classification_weight is not None:
+        classification_weight = args.classification_weight
+        print(f"  Using classification loss weight from command-line: {classification_weight}")
+    else:
+        classification_weight = config.get('classification_loss_weight', 1.0)  # Default to 1.0 if not in config
+        if classification_weight != 1.0:
+            print(f"  Using classification loss weight from config: {classification_weight}")
+
     # Determine coherence loss weight (command-line overrides config)
     if args.coherence_weight is not None:
         coherence_weight = args.coherence_weight
@@ -475,7 +480,7 @@ def main():
 
     for epoch in range(args.epochs):
         # Train
-        train_metrics = train_epoch(model, train_loader, optimizer, args.device, coherence_weight, latent_noise_stddev)
+        train_metrics = train_epoch(model, train_loader, optimizer, args.device, classification_weight, coherence_weight, latent_noise_stddev)
 
         # Validate
         val_metrics = validate(model, val_loader, args.device)
@@ -514,6 +519,7 @@ def main():
                 'latent_channels': latent_channels if args.use_bottleneck else None,
                 'use_maxpool': use_maxpool if args.use_bottleneck else None,
                 'pool_size': pool_size if args.use_bottleneck else None,
+                'classification_loss_weight': classification_weight,
                 'coherence_loss_weight': coherence_weight,
                 'latent_noise_stddev': latent_noise_stddev,
             }

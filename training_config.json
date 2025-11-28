@@ -1,17 +1,10 @@
 {
-    "n": 1000,
-    "p_one": 0.3,
-    "p_color": 0.5,
-    "p_size": 0.5,
-    "colors": ["red", "blue", "green"],
-    "sizes": ["small", "medium", "large"],
-    "shapes": ["circle", "square", "triangle"],
-    "rels": ["on", "above", "and", "beside"],
     "latent_size": 32,
     "latent_channels": 3,
-    "learning_rate": 0.001,
+    "learning_rate": 0.0005,
     "use_maxpool": true,
     "pool_size": 2,
-    "coherence_loss_weight": 1.0,
-    "latent_noise_stddev": 0.0
+    "classification_loss_weight": 1.0,
+    "coherence_loss_weight": 2.0,
+    "latent_noise_stddev": 0.5
 }
