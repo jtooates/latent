@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 from vocab import build_vocab_from_data, Tokenizer, Vocabulary
 from model import SimpleTextEncoder, PropertyHead, FullModel, ImagePropertyHead, FullModelWithBottleneck
@@ -39,52 +39,62 @@ def compute_loss(outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor
     return total_loss
 
 
-def compute_gradient_coherence_loss(Z: torch.Tensor) -> torch.Tensor:
-    """Compute gradient coherence loss to encourage similar edges across RGB channels.
+def compute_mask_sparsity_loss(mask: torch.Tensor) -> torch.Tensor:
+    """Compute sparsity loss to prevent mask from covering entire latent.
 
-    This loss penalizes differences in spatial gradients between channel pairs,
-    encouraging edges and features to appear at the same locations in all channels.
+    Penalizes the mean value of the mask, encouraging sparse (low average) coverage.
 
     Args:
-        Z: Latent image tensor [batch_size, channels, height, width].
-           Assumes channels=3 for RGB.
+        mask: [batch_size, 1, height, width] Learned mask in range [0, 1].
 
     Returns:
-        Scalar coherence loss value.
+        Scalar sparsity loss (lower = more sparse).
     """
-    if Z.size(1) != 3:
-        # Only applies to 3-channel (RGB) latents
-        return torch.tensor(0.0, device=Z.device)
+    return mask.mean()
 
-    # Extract individual channels
-    R = Z[:, 0]  # [B, H, W]
-    G = Z[:, 1]
-    B = Z[:, 2]
 
+def compute_mask_smoothness_loss(mask: torch.Tensor) -> torch.Tensor:
+    """Compute smoothness (TV-like) loss to concentrate mask in one area.
+
+    Encourages mask to be a single contiguous region rather than scattered speckles.
+    Uses isotropic L1 TV: sqrt(dx^2 + dy^2).
+
+    Args:
+        mask: [batch_size, 1, height, width] Learned mask in range [0, 1].
+
+    Returns:
+        Scalar smoothness loss (lower = more concentrated/smooth).
+    """
     # Compute horizontal gradients (x direction)
-    grad_x_R = R[:, :, 1:] - R[:, :, :-1]  # [B, H, W-1]
-    grad_x_G = G[:, :, 1:] - G[:, :, :-1]
-    grad_x_B = B[:, :, 1:] - B[:, :, :-1]
+    grad_x = mask[:, :, :, 1:] - mask[:, :, :, :-1]  # [B, 1, H, W-1]
 
     # Compute vertical gradients (y direction)
-    grad_y_R = R[:, 1:, :] - R[:, :-1, :]  # [B, H-1, W]
-    grad_y_G = G[:, 1:, :] - G[:, :-1, :]
-    grad_y_B = B[:, 1:, :] - B[:, :-1, :]
+    grad_y = mask[:, :, 1:, :] - mask[:, :, :-1, :]  # [B, 1, H-1, W]
 
-    # Compute pairwise gradient differences (horizontal)
-    diff_x_RG = (grad_x_R - grad_x_G).abs().mean()
-    diff_x_RB = (grad_x_R - grad_x_B).abs().mean()
-    diff_x_GB = (grad_x_G - grad_x_B).abs().mean()
+    # Crop to common spatial extent: [H-1, W-1]
+    grad_x_cropped = grad_x[:, :, :-1, :]  # [B, 1, H-1, W-1]
+    grad_y_cropped = grad_y[:, :, :, :-1]  # [B, 1, H-1, W-1]
 
-    # Compute pairwise gradient differences (vertical)
-    diff_y_RG = (grad_y_R - grad_y_G).abs().mean()
-    diff_y_RB = (grad_y_R - grad_y_B).abs().mean()
-    diff_y_GB = (grad_y_G - grad_y_B).abs().mean()
+    # Compute isotropic TV: sqrt(grad_x^2 + grad_y^2 + eps)
+    eps = 1e-8
+    tv_loss = torch.sqrt(grad_x_cropped ** 2 + grad_y_cropped ** 2 + eps).mean()
 
-    # Total coherence loss (average of all pairwise differences)
-    coherence_loss = (diff_x_RG + diff_x_RB + diff_x_GB + diff_y_RG + diff_y_RB + diff_y_GB) / 6.0
+    return tv_loss
 
-    return coherence_loss
+
+def compute_mask_binary_loss(mask: torch.Tensor) -> torch.Tensor:
+    """Compute binary loss to push mask values toward 0 or 1.
+
+    Loss is minimized when mask values are binary (either 0 or 1).
+    Uses the formula: mean(mask * (1 - mask)) which equals 0 for binary values.
+
+    Args:
+        mask: [batch_size, 1, height, width] Learned mask in range [0, 1].
+
+    Returns:
+        Scalar binary loss (0 when mask is perfectly binary).
+    """
+    return (mask * (1.0 - mask)).mean()
 
 
 def compute_accuracy(outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
@@ -109,7 +119,17 @@ def compute_accuracy(outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Te
     return accuracies
 
 
-def train_epoch(model, train_loader, optimizer, device, classification_weight: float = 1.0, coherence_weight: float = 0.0, noise_stddev: float = 0.0) -> Dict[str, float]:
+def train_epoch(
+    model,
+    train_loader,
+    optimizer,
+    device,
+    noise_stddev: float = 0.0,
+    classification_weight: float = 1.0,
+    mask_sparsity_weight: float = 0.0,
+    mask_smoothness_weight: float = 0.0,
+    mask_binary_weight: float = 0.0
+) -> Dict[str, float]:
     """Train for one epoch.
 
     Args:
@@ -117,21 +137,26 @@ def train_epoch(model, train_loader, optimizer, device, classification_weight: f
         train_loader: DataLoader for training data.
         optimizer: Optimizer.
         device: Device to train on.
-        classification_weight: Weight for classification loss.
-        coherence_weight: Weight for gradient coherence loss (only applies to bottleneck models).
         noise_stddev: Standard deviation of Gaussian noise to add to latent (only applies to bottleneck models).
+        classification_weight: Weight for classification loss.
+        mask_sparsity_weight: Weight for mask sparsity loss (only applies when model uses mask).
+        mask_smoothness_weight: Weight for mask smoothness loss (only applies when model uses mask).
+        mask_binary_weight: Weight for mask binary loss (only applies when model uses mask).
 
     Returns:
-        Dictionary with average loss, coherence loss, and accuracies.
+        Dictionary with average loss, mask losses, and accuracies.
     """
     model.train()
     total_loss = 0.0
     total_classification_loss = 0.0
-    total_coherence_loss = 0.0
+    total_mask_sparsity_loss = 0.0
+    total_mask_smoothness_loss = 0.0
+    total_mask_binary_loss = 0.0
     total_accs = {prop: 0.0 for prop in ['color1', 'size1', 'shape1', 'color2', 'size2', 'shape2', 'rel']}
     num_batches = 0
 
-    use_coherence = isinstance(model, FullModelWithBottleneck) and coherence_weight > 0
+    # Check if model uses mask
+    use_mask = isinstance(model, FullModelWithBottleneck) and hasattr(model, 'use_mask') and model.use_mask
 
     for batch in train_loader:
         # Move to device
@@ -140,28 +165,39 @@ def train_epoch(model, train_loader, optimizer, device, classification_weight: f
         labels = {k: v.to(device) for k, v in batch.items() if k not in ['token_ids', 'attn_mask']}
 
         # Forward pass
-        if use_coherence:
-            # Need to get latent image for coherence loss
-            outputs, Z = model(token_ids, attn_mask, return_latent_image=True, noise_stddev=noise_stddev)
+        if use_mask:
+            # Need to get mask for loss computation
+            outputs, Z, mask = model(token_ids, attn_mask, return_latent_image=True, noise_stddev=noise_stddev)
+        elif isinstance(model, FullModelWithBottleneck):
+            outputs = model(token_ids, attn_mask, noise_stddev=noise_stddev)
         else:
-            if isinstance(model, FullModelWithBottleneck):
-                outputs = model(token_ids, attn_mask, noise_stddev=noise_stddev)
-            else:
-                outputs = model(token_ids, attn_mask)
-            # Handle tuple return from FullModelWithBottleneck without explicit return_latent_image
-            if isinstance(outputs, tuple):
-                outputs = outputs[0]
+            outputs = model(token_ids, attn_mask)
+
+        # Handle tuple return from FullModelWithBottleneck without explicit return_latent_image
+        if isinstance(outputs, tuple) and not use_mask:
+            outputs = outputs[0]
 
         # Compute classification loss
         classification_loss = compute_loss(outputs, labels)
+        loss = classification_weight * classification_loss
+        total_classification_loss += classification_loss.item()
 
-        # Compute coherence loss if applicable
-        if use_coherence:
-            coherence_loss = compute_gradient_coherence_loss(Z)
-            loss = classification_weight * classification_loss + coherence_weight * coherence_loss
-            total_coherence_loss += coherence_loss.item()
-        else:
-            loss = classification_weight * classification_loss
+        # Add mask losses if using mask
+        if use_mask and (mask_sparsity_weight > 0 or mask_smoothness_weight > 0 or mask_binary_weight > 0):
+            if mask_sparsity_weight > 0:
+                sparsity_loss = compute_mask_sparsity_loss(mask)
+                loss = loss + mask_sparsity_weight * sparsity_loss
+                total_mask_sparsity_loss += sparsity_loss.item()
+
+            if mask_smoothness_weight > 0:
+                smoothness_loss = compute_mask_smoothness_loss(mask)
+                loss = loss + mask_smoothness_weight * smoothness_loss
+                total_mask_smoothness_loss += smoothness_loss.item()
+
+            if mask_binary_weight > 0:
+                binary_loss = compute_mask_binary_loss(mask)
+                loss = loss + mask_binary_weight * binary_loss
+                total_mask_binary_loss += binary_loss.item()
 
         # Backward pass
         optimizer.zero_grad()
@@ -170,7 +206,6 @@ def train_epoch(model, train_loader, optimizer, device, classification_weight: f
 
         # Track metrics
         total_loss += loss.item()
-        total_classification_loss += classification_loss.item()
         accs = compute_accuracy(outputs, labels)
         for prop, acc in accs.items():
             total_accs[prop] += acc
@@ -179,15 +214,24 @@ def train_epoch(model, train_loader, optimizer, device, classification_weight: f
     # Average metrics
     avg_loss = total_loss / num_batches
     avg_classification_loss = total_classification_loss / num_batches
-    avg_coherence_loss = total_coherence_loss / num_batches if use_coherence else 0.0
+    avg_mask_sparsity = total_mask_sparsity_loss / num_batches if use_mask and mask_sparsity_weight > 0 else 0.0
+    avg_mask_smoothness = total_mask_smoothness_loss / num_batches if use_mask and mask_smoothness_weight > 0 else 0.0
+    avg_mask_binary = total_mask_binary_loss / num_batches if use_mask and mask_binary_weight > 0 else 0.0
     avg_accs = {prop: total_accs[prop] / num_batches for prop in total_accs}
 
-    return {
+    result = {
         'loss': avg_loss,
         'classification_loss': avg_classification_loss,
-        'coherence_loss': avg_coherence_loss,
         **avg_accs
     }
+
+    # Add mask losses to result if using mask
+    if use_mask:
+        result['mask_sparsity'] = avg_mask_sparsity
+        result['mask_smoothness'] = avg_mask_smoothness
+        result['mask_binary'] = avg_mask_binary
+
+    return result
 
 
 def save_sample_latent_images(
@@ -222,8 +266,14 @@ def save_sample_latent_images(
     attn_mask = batch['attn_mask'][:num_samples].to(device)
 
     # Get latent images
+    mask = None
     with torch.no_grad():
-        outputs, Z = model(token_ids, attn_mask, return_latent_image=True)
+        result = model(token_ids, attn_mask, return_latent_image=True)
+        # Handle both cases: (outputs, Z) or (outputs, Z, mask)
+        if len(result) == 3:
+            outputs, Z, mask = result
+        else:
+            outputs, Z = result
 
     # Decode sentences
     sentences = []
@@ -232,7 +282,7 @@ def save_sample_latent_images(
         sentence = tokenizer.decode(ids, skip_special=True)
         sentences.append(sentence)
 
-    # Save images
+    # Save latent images
     save_latent_images(
         Z.cpu(),
         sentences,
@@ -242,7 +292,20 @@ def save_sample_latent_images(
         norm_method='minmax'
     )
 
-    print(f"  → Saved {num_samples} latent images to {output_dir}")
+    # Save masks if using mask module
+    if mask is not None:
+        mask_output_dir = output_dir / "masks"
+        save_latent_images(
+            mask.cpu(),
+            sentences,
+            str(mask_output_dir),
+            prefix=f"epoch_{epoch:03d}",
+            normalize=True,
+            norm_method='minmax'
+        )
+        print(f"  → Saved {num_samples} latent images and masks to {output_dir}")
+    else:
+        print(f"  → Saved {num_samples} latent images to {output_dir}")
 
 
 def validate(model, val_loader, device) -> Dict[str, float]:
@@ -301,6 +364,7 @@ def main():
     parser.add_argument('--lr', type=float, default=None, help='Learning rate (overrides config file if specified)')
     parser.add_argument('--output-dir', type=str, default='checkpoints', help='Output directory for checkpoints')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume training from')
 
     # Bottleneck architecture arguments
     parser.add_argument('--use-bottleneck', action='store_true', help='Use image bottleneck architecture')
@@ -308,9 +372,12 @@ def main():
     parser.add_argument('--latent-channels', type=int, default=None, help='Number of channels in latent image (1 or 3, overrides config)')
     parser.add_argument('--save-images-every', type=int, default=10, help='Save latent images every N epochs')
     parser.add_argument('--image-output-dir', type=str, default='latent_images', help='Directory for saving latent images')
-    parser.add_argument('--classification-weight', type=float, default=None, help='Weight for classification loss (overrides config)')
-    parser.add_argument('--coherence-weight', type=float, default=None, help='Weight for gradient coherence loss (overrides config)')
     parser.add_argument('--latent-noise', type=float, default=None, help='Stddev of Gaussian noise to add to latent (overrides config)')
+    parser.add_argument('--classification-weight', type=float, default=None, help='Weight for classification loss (overrides config)')
+    parser.add_argument('--use-mask', action='store_true', help='Use learned mask module for spatial localization')
+    parser.add_argument('--mask-sparsity-weight', type=float, default=None, help='Weight for mask sparsity loss (overrides config)')
+    parser.add_argument('--mask-smoothness-weight', type=float, default=None, help='Weight for mask smoothness loss (overrides config)')
+    parser.add_argument('--mask-binary-weight', type=float, default=None, help='Weight for mask binary loss (overrides config)')
 
     args = parser.parse_args()
 
@@ -404,7 +471,12 @@ def main():
             pool_size=pool_size
         )
 
-        model = FullModelWithBottleneck(encoder, head, latent_size, latent_channels)
+        # Determine if using mask (command-line overrides config)
+        use_mask = args.use_mask if args.use_mask else config.get('use_mask', False)
+        if use_mask:
+            print(f"  Using learned mask module for spatial localization")
+
+        model = FullModelWithBottleneck(encoder, head, latent_size, latent_channels, use_mask=use_mask)
     else:
         print("  Using direct vector-to-labels architecture")
 
@@ -442,23 +514,44 @@ def main():
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    # Determine classification loss weight (command-line overrides config)
-    if args.classification_weight is not None:
-        classification_weight = args.classification_weight
-        print(f"  Using classification loss weight from command-line: {classification_weight}")
-    else:
-        classification_weight = config.get('classification_loss_weight', 1.0)  # Default to 1.0 if not in config
-        if classification_weight != 1.0:
-            print(f"  Using classification loss weight from config: {classification_weight}")
+    # Load checkpoint if resuming
+    start_epoch = 0
+    best_val_loss = float('inf')
+    if args.resume:
+        print(f"\nLoading checkpoint from {args.resume}...")
+        checkpoint = torch.load(args.resume, map_location=args.device)
 
-    # Determine coherence loss weight (command-line overrides config)
-    if args.coherence_weight is not None:
-        coherence_weight = args.coherence_weight
-        print(f"  Using coherence loss weight from command-line: {coherence_weight}")
-    else:
-        coherence_weight = config.get('coherence_loss_weight', 0.0)  # Default to 0.0 if not in config
-        if coherence_weight > 0:
-            print(f"  Using coherence loss weight from config: {coherence_weight}")
+        # If using maxpool bottleneck, need to do a dummy forward pass to initialize the MLP
+        if args.use_bottleneck and use_maxpool:
+            print(f"  Initializing dynamic MLP for maxpool model...")
+            with torch.no_grad():
+                dummy_tokens = torch.zeros(1, 12, dtype=torch.long).to(args.device)
+                dummy_mask = torch.ones(1, 12, dtype=torch.long).to(args.device)
+                dummy_latent_vec = model.encoder(dummy_tokens, dummy_mask)
+                dummy_latent_img = dummy_latent_vec.view(1, latent_channels, latent_size, latent_size)
+                _ = model.head(dummy_latent_img)  # This initializes the MLP
+            print(f"  ✓ MLP initialized")
+
+        # Load model state
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"  ✓ Loaded model state")
+
+        # Load optimizer state
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        print(f"  ✓ Loaded optimizer state")
+
+        # Resume from next epoch
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_loss = checkpoint.get('val_loss', float('inf'))
+        print(f"  ✓ Resuming from epoch {start_epoch} (best val loss: {best_val_loss:.4f})")
+
+        # Override config with checkpoint values if not specified on command line
+        if args.use_bottleneck and 'latent_size' in checkpoint:
+            if args.latent_size is None:
+                latent_size = checkpoint['latent_size']
+            if args.latent_channels is None:
+                latent_channels = checkpoint['latent_channels']
+            print(f"  ✓ Using checkpoint latent config: {latent_channels}×{latent_size}×{latent_size}")
 
     # Determine latent noise stddev (command-line overrides config)
     if args.latent_noise is not None:
@@ -469,29 +562,79 @@ def main():
         if latent_noise_stddev > 0:
             print(f"  Using latent noise stddev from config: {latent_noise_stddev}")
 
+    # Determine classification weight (command-line overrides config)
+    if args.classification_weight is not None:
+        classification_weight = args.classification_weight
+        print(f"  Using classification weight from command-line: {classification_weight}")
+    else:
+        classification_weight = config.get('classification_weight', 1.0)  # Default to 1.0 if not in config
+        if classification_weight != 1.0:
+            print(f"  Using classification weight from config: {classification_weight}")
+
+    # Determine mask loss weights (command-line overrides config)
+    if args.mask_sparsity_weight is not None:
+        mask_sparsity_weight = args.mask_sparsity_weight
+        print(f"  Using mask sparsity weight from command-line: {mask_sparsity_weight}")
+    else:
+        mask_sparsity_weight = config.get('mask_sparsity_weight', 0.0)
+        if mask_sparsity_weight > 0:
+            print(f"  Using mask sparsity weight from config: {mask_sparsity_weight}")
+
+    if args.mask_smoothness_weight is not None:
+        mask_smoothness_weight = args.mask_smoothness_weight
+        print(f"  Using mask smoothness weight from command-line: {mask_smoothness_weight}")
+    else:
+        mask_smoothness_weight = config.get('mask_smoothness_weight', 0.0)
+        if mask_smoothness_weight > 0:
+            print(f"  Using mask smoothness weight from config: {mask_smoothness_weight}")
+
+    if args.mask_binary_weight is not None:
+        mask_binary_weight = args.mask_binary_weight
+        print(f"  Using mask binary weight from command-line: {mask_binary_weight}")
+    else:
+        mask_binary_weight = config.get('mask_binary_weight', 0.0)
+        if mask_binary_weight > 0:
+            print(f"  Using mask binary weight from config: {mask_binary_weight}")
+
     # Training loop
-    print(f"\nTraining on {args.device} for {args.epochs} epochs...\n")
-    best_val_loss = float('inf')
+    # When resuming, --epochs means "train for N more epochs"
+    # When not resuming, --epochs means "train for N epochs total"
+    if args.resume:
+        end_epoch = start_epoch + args.epochs
+        print(f"\nResuming training on {args.device} from epoch {start_epoch} to {end_epoch - 1} ({args.epochs} additional epochs)...\n")
+    else:
+        end_epoch = args.epochs
+        print(f"\nTraining on {args.device} for {args.epochs} epochs...\n")
 
     # Create image output directory if using bottleneck
     if args.use_bottleneck:
         image_output_dir = Path(args.image_output_dir)
         image_output_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, end_epoch):
         # Train
-        train_metrics = train_epoch(model, train_loader, optimizer, args.device, classification_weight, coherence_weight, latent_noise_stddev)
+        train_metrics = train_epoch(model, train_loader, optimizer, args.device, latent_noise_stddev,
+                                    classification_weight, mask_sparsity_weight, mask_smoothness_weight, mask_binary_weight)
 
         # Validate
         val_metrics = validate(model, val_loader, args.device)
 
         # Print metrics
         print(f"Epoch {epoch + 1}/{args.epochs}")
-        if coherence_weight > 0:
-            print(f"  Train Loss: {train_metrics['loss']:.4f} (class: {train_metrics['classification_loss']:.4f}, "
-                  f"coherence: {train_metrics['coherence_loss']:.4f}) | Val Loss: {val_metrics['loss']:.4f}")
+
+        # Print loss breakdown if using mask
+        if 'mask_sparsity' in train_metrics or 'mask_smoothness' in train_metrics or 'mask_binary' in train_metrics:
+            loss_parts = [f"class: {train_metrics['classification_loss']:.4f}"]
+            if 'mask_sparsity' in train_metrics and mask_sparsity_weight > 0:
+                loss_parts.append(f"mask_sparse: {train_metrics['mask_sparsity']:.4f}")
+            if 'mask_smoothness' in train_metrics and mask_smoothness_weight > 0:
+                loss_parts.append(f"mask_smooth: {train_metrics['mask_smoothness']:.4f}")
+            if 'mask_binary' in train_metrics and mask_binary_weight > 0:
+                loss_parts.append(f"mask_binary: {train_metrics['mask_binary']:.4f}")
+            print(f"  Train Loss: {train_metrics['loss']:.4f} ({', '.join(loss_parts)}) | Val Loss: {val_metrics['loss']:.4f}")
         else:
             print(f"  Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_metrics['loss']:.4f}")
+
         print(f"  Train Acc: color1={train_metrics['color1']:.3f}, size1={train_metrics['size1']:.3f}, "
               f"shape1={train_metrics['shape1']:.3f}, color2={train_metrics['color2']:.3f}, "
               f"size2={train_metrics['size2']:.3f}, shape2={train_metrics['shape2']:.3f}, rel={train_metrics['rel']:.3f}")
@@ -519,8 +662,6 @@ def main():
                 'latent_channels': latent_channels if args.use_bottleneck else None,
                 'use_maxpool': use_maxpool if args.use_bottleneck else None,
                 'pool_size': pool_size if args.use_bottleneck else None,
-                'classification_loss_weight': classification_weight,
-                'coherence_loss_weight': coherence_weight,
                 'latent_noise_stddev': latent_noise_stddev,
             }
             torch.save(checkpoint, output_dir / 'best_model.pt')
