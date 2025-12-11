@@ -39,64 +39,6 @@ def compute_loss(outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor
     return total_loss
 
 
-def compute_mask_sparsity_loss(mask: torch.Tensor) -> torch.Tensor:
-    """Compute sparsity loss to prevent mask from covering entire latent.
-
-    Penalizes the mean value of the mask, encouraging sparse (low average) coverage.
-
-    Args:
-        mask: [batch_size, 1, height, width] Learned mask in range [0, 1].
-
-    Returns:
-        Scalar sparsity loss (lower = more sparse).
-    """
-    return mask.mean()
-
-
-def compute_mask_smoothness_loss(mask: torch.Tensor) -> torch.Tensor:
-    """Compute smoothness (TV-like) loss to concentrate mask in one area.
-
-    Encourages mask to be a single contiguous region rather than scattered speckles.
-    Uses isotropic L1 TV: sqrt(dx^2 + dy^2).
-
-    Args:
-        mask: [batch_size, 1, height, width] Learned mask in range [0, 1].
-
-    Returns:
-        Scalar smoothness loss (lower = more concentrated/smooth).
-    """
-    # Compute horizontal gradients (x direction)
-    grad_x = mask[:, :, :, 1:] - mask[:, :, :, :-1]  # [B, 1, H, W-1]
-
-    # Compute vertical gradients (y direction)
-    grad_y = mask[:, :, 1:, :] - mask[:, :, :-1, :]  # [B, 1, H-1, W]
-
-    # Crop to common spatial extent: [H-1, W-1]
-    grad_x_cropped = grad_x[:, :, :-1, :]  # [B, 1, H-1, W-1]
-    grad_y_cropped = grad_y[:, :, :, :-1]  # [B, 1, H-1, W-1]
-
-    # Compute isotropic TV: sqrt(grad_x^2 + grad_y^2 + eps)
-    eps = 1e-8
-    tv_loss = torch.sqrt(grad_x_cropped ** 2 + grad_y_cropped ** 2 + eps).mean()
-
-    return tv_loss
-
-
-def compute_mask_binary_loss(mask: torch.Tensor) -> torch.Tensor:
-    """Compute binary loss to push mask values toward 0 or 1.
-
-    Loss is minimized when mask values are binary (either 0 or 1).
-    Uses the formula: mean(mask * (1 - mask)) which equals 0 for binary values.
-
-    Args:
-        mask: [batch_size, 1, height, width] Learned mask in range [0, 1].
-
-    Returns:
-        Scalar binary loss (0 when mask is perfectly binary).
-    """
-    return (mask * (1.0 - mask)).mean()
-
-
 def compute_accuracy(outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
     """Compute per-property accuracy.
 
@@ -125,10 +67,7 @@ def train_epoch(
     optimizer,
     device,
     noise_stddev: float = 0.0,
-    classification_weight: float = 1.0,
-    mask_sparsity_weight: float = 0.0,
-    mask_smoothness_weight: float = 0.0,
-    mask_binary_weight: float = 0.0
+    classification_weight: float = 1.0
 ) -> Dict[str, float]:
     """Train for one epoch.
 
@@ -139,24 +78,15 @@ def train_epoch(
         device: Device to train on.
         noise_stddev: Standard deviation of Gaussian noise to add to latent (only applies to bottleneck models).
         classification_weight: Weight for classification loss.
-        mask_sparsity_weight: Weight for mask sparsity loss (only applies when model uses mask).
-        mask_smoothness_weight: Weight for mask smoothness loss (only applies when model uses mask).
-        mask_binary_weight: Weight for mask binary loss (only applies when model uses mask).
 
     Returns:
-        Dictionary with average loss, mask losses, and accuracies.
+        Dictionary with average loss and accuracies.
     """
     model.train()
     total_loss = 0.0
     total_classification_loss = 0.0
-    total_mask_sparsity_loss = 0.0
-    total_mask_smoothness_loss = 0.0
-    total_mask_binary_loss = 0.0
     total_accs = {prop: 0.0 for prop in ['color1', 'size1', 'shape1', 'color2', 'size2', 'shape2', 'rel']}
     num_batches = 0
-
-    # Check if model uses mask
-    use_mask = isinstance(model, FullModelWithBottleneck) and hasattr(model, 'use_mask') and model.use_mask
 
     for batch in train_loader:
         # Move to device
@@ -165,39 +95,19 @@ def train_epoch(
         labels = {k: v.to(device) for k, v in batch.items() if k not in ['token_ids', 'attn_mask']}
 
         # Forward pass
-        if use_mask:
-            # Need to get mask for loss computation
-            outputs, Z, mask = model(token_ids, attn_mask, return_latent_image=True, noise_stddev=noise_stddev)
-        elif isinstance(model, FullModelWithBottleneck):
+        if isinstance(model, FullModelWithBottleneck):
             outputs = model(token_ids, attn_mask, noise_stddev=noise_stddev)
         else:
             outputs = model(token_ids, attn_mask)
 
-        # Handle tuple return from FullModelWithBottleneck without explicit return_latent_image
-        if isinstance(outputs, tuple) and not use_mask:
+        # Handle tuple return from FullModelWithBottleneck
+        if isinstance(outputs, tuple):
             outputs = outputs[0]
 
         # Compute classification loss
         classification_loss = compute_loss(outputs, labels)
         loss = classification_weight * classification_loss
         total_classification_loss += classification_loss.item()
-
-        # Add mask losses if using mask
-        if use_mask and (mask_sparsity_weight > 0 or mask_smoothness_weight > 0 or mask_binary_weight > 0):
-            if mask_sparsity_weight > 0:
-                sparsity_loss = compute_mask_sparsity_loss(mask)
-                loss = loss + mask_sparsity_weight * sparsity_loss
-                total_mask_sparsity_loss += sparsity_loss.item()
-
-            if mask_smoothness_weight > 0:
-                smoothness_loss = compute_mask_smoothness_loss(mask)
-                loss = loss + mask_smoothness_weight * smoothness_loss
-                total_mask_smoothness_loss += smoothness_loss.item()
-
-            if mask_binary_weight > 0:
-                binary_loss = compute_mask_binary_loss(mask)
-                loss = loss + mask_binary_weight * binary_loss
-                total_mask_binary_loss += binary_loss.item()
 
         # Backward pass
         optimizer.zero_grad()
@@ -214,24 +124,13 @@ def train_epoch(
     # Average metrics
     avg_loss = total_loss / num_batches
     avg_classification_loss = total_classification_loss / num_batches
-    avg_mask_sparsity = total_mask_sparsity_loss / num_batches if use_mask and mask_sparsity_weight > 0 else 0.0
-    avg_mask_smoothness = total_mask_smoothness_loss / num_batches if use_mask and mask_smoothness_weight > 0 else 0.0
-    avg_mask_binary = total_mask_binary_loss / num_batches if use_mask and mask_binary_weight > 0 else 0.0
     avg_accs = {prop: total_accs[prop] / num_batches for prop in total_accs}
 
-    result = {
+    return {
         'loss': avg_loss,
         'classification_loss': avg_classification_loss,
         **avg_accs
     }
-
-    # Add mask losses to result if using mask
-    if use_mask:
-        result['mask_sparsity'] = avg_mask_sparsity
-        result['mask_smoothness'] = avg_mask_smoothness
-        result['mask_binary'] = avg_mask_binary
-
-    return result
 
 
 def save_sample_latent_images(
@@ -266,14 +165,8 @@ def save_sample_latent_images(
     attn_mask = batch['attn_mask'][:num_samples].to(device)
 
     # Get latent images
-    mask = None
     with torch.no_grad():
-        result = model(token_ids, attn_mask, return_latent_image=True)
-        # Handle both cases: (outputs, Z) or (outputs, Z, mask)
-        if len(result) == 3:
-            outputs, Z, mask = result
-        else:
-            outputs, Z = result
+        outputs, Z = model(token_ids, attn_mask, return_latent_image=True)
 
     # Decode sentences
     sentences = []
@@ -292,20 +185,7 @@ def save_sample_latent_images(
         norm_method='minmax'
     )
 
-    # Save masks if using mask module
-    if mask is not None:
-        mask_output_dir = output_dir / "masks"
-        save_latent_images(
-            mask.cpu(),
-            sentences,
-            str(mask_output_dir),
-            prefix=f"epoch_{epoch:03d}",
-            normalize=True,
-            norm_method='minmax'
-        )
-        print(f"  → Saved {num_samples} latent images and masks to {output_dir}")
-    else:
-        print(f"  → Saved {num_samples} latent images to {output_dir}")
+    print(f"  → Saved {num_samples} latent images to {output_dir}")
 
 
 def validate(model, val_loader, device) -> Dict[str, float]:
@@ -374,10 +254,6 @@ def main():
     parser.add_argument('--image-output-dir', type=str, default='latent_images', help='Directory for saving latent images')
     parser.add_argument('--latent-noise', type=float, default=None, help='Stddev of Gaussian noise to add to latent (overrides config)')
     parser.add_argument('--classification-weight', type=float, default=None, help='Weight for classification loss (overrides config)')
-    parser.add_argument('--use-mask', action='store_true', help='Use learned mask module for spatial localization')
-    parser.add_argument('--mask-sparsity-weight', type=float, default=None, help='Weight for mask sparsity loss (overrides config)')
-    parser.add_argument('--mask-smoothness-weight', type=float, default=None, help='Weight for mask smoothness loss (overrides config)')
-    parser.add_argument('--mask-binary-weight', type=float, default=None, help='Weight for mask binary loss (overrides config)')
 
     args = parser.parse_args()
 
@@ -471,12 +347,7 @@ def main():
             pool_size=pool_size
         )
 
-        # Determine if using mask (command-line overrides config)
-        use_mask = args.use_mask if args.use_mask else config.get('use_mask', False)
-        if use_mask:
-            print(f"  Using learned mask module for spatial localization")
-
-        model = FullModelWithBottleneck(encoder, head, latent_size, latent_channels, use_mask=use_mask)
+        model = FullModelWithBottleneck(encoder, head, latent_size, latent_channels)
     else:
         print("  Using direct vector-to-labels architecture")
 
@@ -571,31 +442,6 @@ def main():
         if classification_weight != 1.0:
             print(f"  Using classification weight from config: {classification_weight}")
 
-    # Determine mask loss weights (command-line overrides config)
-    if args.mask_sparsity_weight is not None:
-        mask_sparsity_weight = args.mask_sparsity_weight
-        print(f"  Using mask sparsity weight from command-line: {mask_sparsity_weight}")
-    else:
-        mask_sparsity_weight = config.get('mask_sparsity_weight', 0.0)
-        if mask_sparsity_weight > 0:
-            print(f"  Using mask sparsity weight from config: {mask_sparsity_weight}")
-
-    if args.mask_smoothness_weight is not None:
-        mask_smoothness_weight = args.mask_smoothness_weight
-        print(f"  Using mask smoothness weight from command-line: {mask_smoothness_weight}")
-    else:
-        mask_smoothness_weight = config.get('mask_smoothness_weight', 0.0)
-        if mask_smoothness_weight > 0:
-            print(f"  Using mask smoothness weight from config: {mask_smoothness_weight}")
-
-    if args.mask_binary_weight is not None:
-        mask_binary_weight = args.mask_binary_weight
-        print(f"  Using mask binary weight from command-line: {mask_binary_weight}")
-    else:
-        mask_binary_weight = config.get('mask_binary_weight', 0.0)
-        if mask_binary_weight > 0:
-            print(f"  Using mask binary weight from config: {mask_binary_weight}")
-
     # Training loop
     # When resuming, --epochs means "train for N more epochs"
     # When not resuming, --epochs means "train for N epochs total"
@@ -614,26 +460,14 @@ def main():
     for epoch in range(start_epoch, end_epoch):
         # Train
         train_metrics = train_epoch(model, train_loader, optimizer, args.device, latent_noise_stddev,
-                                    classification_weight, mask_sparsity_weight, mask_smoothness_weight, mask_binary_weight)
+                                    classification_weight)
 
         # Validate
         val_metrics = validate(model, val_loader, args.device)
 
         # Print metrics
         print(f"Epoch {epoch + 1}/{args.epochs}")
-
-        # Print loss breakdown if using mask
-        if 'mask_sparsity' in train_metrics or 'mask_smoothness' in train_metrics or 'mask_binary' in train_metrics:
-            loss_parts = [f"class: {train_metrics['classification_loss']:.4f}"]
-            if 'mask_sparsity' in train_metrics and mask_sparsity_weight > 0:
-                loss_parts.append(f"mask_sparse: {train_metrics['mask_sparsity']:.4f}")
-            if 'mask_smoothness' in train_metrics and mask_smoothness_weight > 0:
-                loss_parts.append(f"mask_smooth: {train_metrics['mask_smoothness']:.4f}")
-            if 'mask_binary' in train_metrics and mask_binary_weight > 0:
-                loss_parts.append(f"mask_binary: {train_metrics['mask_binary']:.4f}")
-            print(f"  Train Loss: {train_metrics['loss']:.4f} ({', '.join(loss_parts)}) | Val Loss: {val_metrics['loss']:.4f}")
-        else:
-            print(f"  Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_metrics['loss']:.4f}")
+        print(f"  Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_metrics['loss']:.4f}")
 
         print(f"  Train Acc: color1={train_metrics['color1']:.3f}, size1={train_metrics['size1']:.3f}, "
               f"shape1={train_metrics['shape1']:.3f}, color2={train_metrics['color2']:.3f}, "

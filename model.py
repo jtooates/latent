@@ -229,71 +229,6 @@ class ImageBottleneck(nn.Module):
         return Z
 
 
-class LearnedMaskModule(nn.Module):
-    """Per-example learned mask that forces decoder to use a single spatial region.
-
-    Architecture:
-        Input latent [B, C, H, W] -> Small CNN -> Mask [B, 1, H, W] ->
-        Sigmoid -> Pointwise multiply -> Masked latent [B, C, H, W]
-
-    The mask is optimized with three losses:
-    1. Sparsity: mean(mask) to prevent covering entire latent
-    2. Smoothness: TV loss to concentrate mask in one area (not speckles)
-    3. Binary: mean(mask * (1-mask)) to push values toward 0 or 1
-    """
-
-    def __init__(self, latent_size: int = 32, latent_channels: int = 3):
-        """Initialize the learned mask module.
-
-        Args:
-            latent_size: Spatial size of latent image (H=W).
-            latent_channels: Number of channels in latent image (usually 3 for RGB).
-        """
-        super().__init__()
-        self.latent_size = latent_size
-        self.latent_channels = latent_channels
-
-        # Small CNN to generate mask from latent
-        # Input: [B, C, H, W] -> Output: [B, 1, H, W]
-        self.mask_network = nn.Sequential(
-            nn.Conv2d(latent_channels, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(16, 8, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(8, 1, kernel_size=3, padding=1),
-            # No sigmoid here - we'll apply it in forward for clarity
-        )
-
-        # Initialize with random uniform [0, 1] -> after sigmoid, output will be ~[0.27, 0.73]
-        # This gives a good starting point for the binary loss to push toward 0 or 1
-        for m in self.mask_network.modules():
-            if isinstance(m, nn.Conv2d):
-                # Initialize weights uniformly
-                nn.init.uniform_(m.weight, -1.0, 1.0)
-                if m.bias is not None:
-                    nn.init.uniform_(m.bias, -1.0, 1.0)
-
-    def forward(self, Z: torch.Tensor):
-        """Apply learned mask to latent image.
-
-        Args:
-            Z: [batch_size, channels, height, width] Input latent image.
-
-        Returns:
-            Tuple of:
-                - Z_masked: [batch_size, channels, height, width] Masked latent.
-                - mask: [batch_size, 1, height, width] Learned mask in [0, 1].
-        """
-        # Generate mask from latent
-        mask_logits = self.mask_network(Z)  # [B, 1, H, W]
-        mask = torch.sigmoid(mask_logits)    # [B, 1, H, W] in range [0, 1]
-
-        # Apply mask via pointwise multiplication (broadcasts across channels)
-        Z_masked = Z * mask  # [B, C, H, W] * [B, 1, H, W] -> [B, C, H, W]
-
-        return Z_masked, mask
-
-
 class ImagePropertyHead(nn.Module):
     """CNN-based property head that reads from latent images.
 
@@ -487,8 +422,7 @@ class FullModelWithBottleneck(nn.Module):
         encoder: SimpleTextEncoder,
         head: ImagePropertyHead,
         latent_size: int = 32,
-        latent_channels: int = 3,
-        use_mask: bool = False
+        latent_channels: int = 3
     ):
         """Initialize the full model with bottleneck.
 
@@ -497,20 +431,12 @@ class FullModelWithBottleneck(nn.Module):
             head: CNN-based property head that reads from images.
             latent_size: Spatial size of latent image (N in N×N).
             latent_channels: Number of channels in latent image (C).
-            use_mask: If True, use learned mask module to force spatial localization.
         """
         super().__init__()
         self.encoder = encoder
         self.head = head
         self.latent_size = latent_size
         self.latent_channels = latent_channels
-        self.use_mask = use_mask
-
-        # Initialize learned mask module if requested
-        if use_mask:
-            self.mask_module = LearnedMaskModule(latent_size, latent_channels)
-        else:
-            self.mask_module = None
 
     def forward(
         self,
@@ -548,21 +474,11 @@ class FullModelWithBottleneck(nn.Module):
         else:
             Z_noisy = Z
 
-        # 4. Apply learned mask (after noise, before head)
-        mask = None
-        if self.use_mask:
-            Z_noisy, mask = self.mask_module(Z_noisy)
-            # Z_noisy is now masked: [B, C, N, N]
-            # mask is: [B, 1, N, N]
-
-        # 5. Predict properties from image
+        # 4. Predict properties from image
         outputs = self.head(Z_noisy)
 
         if return_latent_image:
-            # Return clean latent image (without noise) and mask for loss computation
-            if self.use_mask:
-                return outputs, Z, mask
-            else:
-                return outputs, Z
+            # Return clean latent image (without noise)
+            return outputs, Z
         else:
             return outputs
