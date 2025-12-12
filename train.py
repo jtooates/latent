@@ -10,7 +10,10 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 from vocab import build_vocab_from_data, Tokenizer, Vocabulary
-from model import SimpleTextEncoder, PropertyHead, FullModel, ImagePropertyHead, FullModelWithBottleneck
+from model import (
+    SimpleTextEncoder, PropertyHead, FullModel, ImagePropertyHead,
+    FullModelWithBottleneck, CanvasPainterEncoder, FullModelWithCanvasPainter
+)
 from dataset import PropertyEncoder, create_dataloaders
 from image_utils import save_latent_images
 from scene_generator import scene_to_sentence
@@ -95,12 +98,12 @@ def train_epoch(
         labels = {k: v.to(device) for k, v in batch.items() if k not in ['token_ids', 'attn_mask']}
 
         # Forward pass
-        if isinstance(model, FullModelWithBottleneck):
+        if isinstance(model, (FullModelWithBottleneck, FullModelWithCanvasPainter)):
             outputs = model(token_ids, attn_mask, noise_stddev=noise_stddev)
         else:
             outputs = model(token_ids, attn_mask)
 
-        # Handle tuple return from FullModelWithBottleneck
+        # Handle tuple return from bottleneck or canvas painter models
         if isinstance(outputs, tuple):
             outputs = outputs[0]
 
@@ -153,8 +156,8 @@ def save_sample_latent_images(
         device: Device to run inference on.
         num_samples: Number of samples to save.
     """
-    if not isinstance(model, FullModelWithBottleneck):
-        return  # Only save for bottleneck models
+    if not isinstance(model, (FullModelWithBottleneck, FullModelWithCanvasPainter)):
+        return  # Only save for bottleneck and canvas painter models
 
     model.eval()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -175,17 +178,18 @@ def save_sample_latent_images(
         sentence = tokenizer.decode(ids, skip_special=True)
         sentences.append(sentence)
 
-    # Save latent images
+    # Save latent images (scaled to 512x512 for visibility)
     save_latent_images(
         Z.cpu(),
         sentences,
         str(output_dir),
         prefix=f"epoch_{epoch:03d}",
         normalize=True,
-        norm_method='minmax'
+        norm_method='minmax',
+        scale_size=512
     )
 
-    print(f"  → Saved {num_samples} latent images to {output_dir}")
+    print(f"  → Saved {num_samples} latent images (512x512) to {output_dir}")
 
 
 def validate(model, val_loader, device) -> Dict[str, float]:
@@ -255,6 +259,14 @@ def main():
     parser.add_argument('--latent-noise', type=float, default=None, help='Stddev of Gaussian noise to add to latent (overrides config)')
     parser.add_argument('--classification-weight', type=float, default=None, help='Weight for classification loss (overrides config)')
 
+    # Canvas painter arguments
+    parser.add_argument('--use-canvas-painter', action='store_true', help='Use DRAW-style canvas painter encoder')
+    parser.add_argument('--painter-d-state', type=int, default=None, help='Painter GRU hidden size (overrides config)')
+    parser.add_argument('--painter-patch-size', type=int, default=None, help='Write patch size K (overrides config)')
+    parser.add_argument('--painter-num-steps', type=int, default=None, help='Number of painting steps (0=use num tokens, overrides config)')
+    parser.add_argument('--canvas-blur-kernel', type=int, default=None, help='Canvas blur kernel size (0=no blur, 3, 5, 7, etc.)')
+    parser.add_argument('--canvas-blur-sigma', type=float, default=None, help='Canvas blur sigma (overrides config)')
+
     args = parser.parse_args()
 
     # Create output directory
@@ -288,10 +300,169 @@ def main():
           f"{property_encoder.n_sizes} sizes, {property_encoder.n_shapes} shapes, "
           f"{property_encoder.n_rels} relationships")
 
+    # Load checkpoint early if resuming to determine architecture
+    resume_checkpoint = None
+    if args.resume:
+        print(f"\nDetecting architecture from checkpoint: {args.resume}")
+        resume_checkpoint = torch.load(args.resume, map_location=args.device)
+        print(f"  ✓ Checkpoint loaded (epoch {resume_checkpoint['epoch']})")
+
     # Create model
     print("Creating model...")
 
-    if args.use_bottleneck:
+    # Check if using canvas painter (checkpoint overrides if resuming)
+    if resume_checkpoint is not None:
+        # When resuming, use architecture from checkpoint
+        use_canvas_painter = resume_checkpoint.get('use_canvas_painter', False)
+        if use_canvas_painter:
+            print("  Detected canvas painter architecture from checkpoint")
+        elif resume_checkpoint.get('use_bottleneck', False):
+            print("  Detected bottleneck architecture from checkpoint")
+        else:
+            print("  Detected standard architecture from checkpoint")
+    else:
+        # When training from scratch, use config/CLI
+        use_canvas_painter = args.use_canvas_painter if args.use_canvas_painter else config.get('use_canvas_painter', False)
+
+    if use_canvas_painter:
+        print("  Using DRAW-style canvas painter architecture")
+
+        # When resuming, prefer checkpoint config over training_config.json
+        effective_config = resume_checkpoint['config'] if resume_checkpoint else config
+
+        # Determine latent size (command-line overrides checkpoint/config)
+        if args.latent_size is not None:
+            latent_size = args.latent_size
+            print(f"  Using latent size from command-line: {latent_size}")
+        elif resume_checkpoint and 'latent_size' in resume_checkpoint:
+            latent_size = resume_checkpoint['latent_size']
+            print(f"  Using latent size from checkpoint: {latent_size}")
+        else:
+            latent_size = effective_config.get('latent_size', 32)
+            print(f"  Using latent size from config: {latent_size}")
+
+        # Determine latent channels (command-line overrides checkpoint/config)
+        if args.latent_channels is not None:
+            latent_channels = args.latent_channels
+            print(f"  Using latent channels from command-line: {latent_channels}")
+        elif resume_checkpoint and 'latent_channels' in resume_checkpoint:
+            latent_channels = resume_checkpoint['latent_channels']
+            print(f"  Using latent channels from checkpoint: {latent_channels}")
+        else:
+            latent_channels = effective_config.get('latent_channels', 3)
+            print(f"  Using latent channels from config: {latent_channels}")
+
+        # Determine painter parameters (command-line overrides checkpoint/config)
+        if args.painter_d_state is not None:
+            painter_d_state = args.painter_d_state
+            print(f"  Using painter d_state from command-line: {painter_d_state}")
+        else:
+            painter_d_state = effective_config.get('painter_d_state', 256)
+            source = "checkpoint" if resume_checkpoint else "config"
+            print(f"  Using painter d_state from {source}: {painter_d_state}")
+
+        if args.painter_patch_size is not None:
+            painter_patch_size = args.painter_patch_size
+            print(f"  Using painter patch size from command-line: {painter_patch_size}")
+        else:
+            painter_patch_size = effective_config.get('painter_patch_size', 5)
+            source = "checkpoint" if resume_checkpoint else "config"
+            print(f"  Using painter patch size from {source}: {painter_patch_size}")
+
+        if args.painter_num_steps is not None:
+            painter_num_steps = args.painter_num_steps
+            print(f"  Using painter num steps from command-line: {painter_num_steps}")
+        else:
+            painter_num_steps = effective_config.get('painter_num_steps', 0)
+            source = "checkpoint" if resume_checkpoint else "config"
+            print(f"  Using painter num steps from {source}: {painter_num_steps}")
+
+        # Determine blur parameters (command-line overrides checkpoint/config)
+        if args.canvas_blur_kernel is not None:
+            canvas_blur_kernel = args.canvas_blur_kernel
+            print(f"  Using canvas blur kernel from command-line: {canvas_blur_kernel}")
+        else:
+            canvas_blur_kernel = effective_config.get('canvas_blur_kernel_size', 0)
+            source = "checkpoint" if resume_checkpoint else "config"
+            print(f"  Using canvas blur kernel from {source}: {canvas_blur_kernel}")
+
+        if args.canvas_blur_sigma is not None:
+            canvas_blur_sigma = args.canvas_blur_sigma
+            print(f"  Using canvas blur sigma from command-line: {canvas_blur_sigma}")
+        else:
+            canvas_blur_sigma = effective_config.get('canvas_blur_sigma', 1.0)
+            source = "checkpoint" if resume_checkpoint else "config"
+            print(f"  Using canvas blur sigma from {source}: {canvas_blur_sigma}")
+
+        print(f"  Canvas: {latent_channels}x{latent_size}x{latent_size}")
+        print(f"  Painter GRU hidden size: {painter_d_state}")
+        print(f"  Write patch size: {painter_patch_size}x{painter_patch_size}")
+        if painter_num_steps > 0:
+            print(f"  Painting steps: {painter_num_steps} (fixed)")
+        else:
+            print(f"  Painting steps: adaptive (num tokens)")
+        if canvas_blur_kernel > 0:
+            print(f"  Canvas blur: kernel={canvas_blur_kernel}, sigma={canvas_blur_sigma}")
+        else:
+            print(f"  Canvas blur: disabled")
+
+        # Create encoder (no latent_dim projection needed for canvas painter)
+        encoder = SimpleTextEncoder(
+            num_tokens=len(vocab),
+            max_len=12,
+            d_model=128,
+            nhead=4,
+            ff_dim=256,
+            num_layers=2
+        )
+
+        # Create canvas painter
+        canvas_painter = CanvasPainterEncoder(
+            d_model=128,
+            d_state=painter_d_state,
+            H=latent_size,
+            W=latent_size,
+            C=latent_channels,
+            K=painter_patch_size,
+            num_steps=painter_num_steps
+        )
+
+        # Get pooling configuration from checkpoint or config
+        if resume_checkpoint and 'use_maxpool' in resume_checkpoint:
+            use_maxpool = resume_checkpoint.get('use_maxpool', False)
+            pool_size = resume_checkpoint.get('pool_size', 2)
+            print(f"  Using pooling config from checkpoint")
+        else:
+            use_maxpool = effective_config.get('use_maxpool', False)
+            pool_size = effective_config.get('pool_size', 2)
+
+        if use_maxpool:
+            print(f"  Using max pooling (kernel size={pool_size}) after each conv layer")
+        else:
+            print(f"  Using global average pooling")
+
+        # Create CNN-based property head
+        head = ImagePropertyHead(
+            img_channels=latent_channels,
+            n_colors=property_encoder.n_colors,
+            n_sizes=property_encoder.n_sizes,
+            n_shapes=property_encoder.n_shapes,
+            n_rels=property_encoder.n_rels,
+            conv_channels=(32, 64),
+            hidden_dim=128,
+            use_maxpool=use_maxpool,
+            pool_size=pool_size
+        )
+
+        model = FullModelWithCanvasPainter(
+            encoder,
+            canvas_painter,
+            head,
+            blur_kernel_size=canvas_blur_kernel,
+            blur_sigma=canvas_blur_sigma
+        )
+
+    elif args.use_bottleneck:
         # Determine latent size (command-line overrides config)
         if args.latent_size is not None:
             latent_size = args.latent_size
@@ -385,44 +556,43 @@ def main():
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    # Load checkpoint if resuming
+    # Load checkpoint weights if resuming
     start_epoch = 0
     best_val_loss = float('inf')
-    if args.resume:
-        print(f"\nLoading checkpoint from {args.resume}...")
-        checkpoint = torch.load(args.resume, map_location=args.device)
+    if resume_checkpoint:
+        print(f"\nRestoring model state from checkpoint...")
 
-        # If using maxpool bottleneck, need to do a dummy forward pass to initialize the MLP
-        if args.use_bottleneck and use_maxpool:
+        # If using maxpool (bottleneck or canvas painter), need dummy forward pass to initialize dynamic MLP
+        if use_maxpool:
             print(f"  Initializing dynamic MLP for maxpool model...")
             with torch.no_grad():
                 dummy_tokens = torch.zeros(1, 12, dtype=torch.long).to(args.device)
                 dummy_mask = torch.ones(1, 12, dtype=torch.long).to(args.device)
-                dummy_latent_vec = model.encoder(dummy_tokens, dummy_mask)
-                dummy_latent_img = dummy_latent_vec.view(1, latent_channels, latent_size, latent_size)
-                _ = model.head(dummy_latent_img)  # This initializes the MLP
+
+                if use_canvas_painter:
+                    # Canvas painter model
+                    token_reps, global_rep = model.encoder(dummy_tokens, dummy_mask, return_token_reps=True)
+                    dummy_canvas = model.canvas_painter(token_reps, global_rep, dummy_mask)
+                    _ = model.head(dummy_canvas)  # This initializes the MLP
+                else:
+                    # Bottleneck model
+                    dummy_latent_vec = model.encoder(dummy_tokens, dummy_mask)
+                    dummy_latent_img = dummy_latent_vec.view(1, latent_channels, latent_size, latent_size)
+                    _ = model.head(dummy_latent_img)  # This initializes the MLP
             print(f"  ✓ MLP initialized")
 
         # Load model state
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(resume_checkpoint['model_state_dict'])
         print(f"  ✓ Loaded model state")
 
         # Load optimizer state
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        optimizer.load_state_dict(resume_checkpoint['optimizer_state_dict'])
         print(f"  ✓ Loaded optimizer state")
 
         # Resume from next epoch
-        start_epoch = checkpoint['epoch'] + 1
-        best_val_loss = checkpoint.get('val_loss', float('inf'))
+        start_epoch = resume_checkpoint['epoch'] + 1
+        best_val_loss = resume_checkpoint.get('val_loss', float('inf'))
         print(f"  ✓ Resuming from epoch {start_epoch} (best val loss: {best_val_loss:.4f})")
-
-        # Override config with checkpoint values if not specified on command line
-        if args.use_bottleneck and 'latent_size' in checkpoint:
-            if args.latent_size is None:
-                latent_size = checkpoint['latent_size']
-            if args.latent_channels is None:
-                latent_channels = checkpoint['latent_channels']
-            print(f"  ✓ Using checkpoint latent config: {latent_channels}×{latent_size}×{latent_size}")
 
     # Determine latent noise stddev (command-line overrides config)
     if args.latent_noise is not None:
@@ -452,8 +622,8 @@ def main():
         end_epoch = args.epochs
         print(f"\nTraining on {args.device} for {args.epochs} epochs...\n")
 
-    # Create image output directory if using bottleneck
-    if args.use_bottleneck:
+    # Create image output directory if using bottleneck or canvas painter
+    if args.use_bottleneck or use_canvas_painter:
         image_output_dir = Path(args.image_output_dir)
         image_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -477,7 +647,7 @@ def main():
               f"size2={val_metrics['size2']:.3f}, shape2={val_metrics['shape2']:.3f}, rel={val_metrics['rel']:.3f}")
 
         # Save latent images periodically
-        if args.use_bottleneck and (epoch + 1) % args.save_images_every == 0:
+        if (args.use_bottleneck or use_canvas_painter) and (epoch + 1) % args.save_images_every == 0:
             save_sample_latent_images(
                 model, val_loader, tokenizer, image_output_dir, epoch + 1, args.device
             )
@@ -492,10 +662,11 @@ def main():
                 'val_loss': val_metrics['loss'],
                 'config': config,
                 'use_bottleneck': args.use_bottleneck,
-                'latent_size': latent_size if args.use_bottleneck else None,
-                'latent_channels': latent_channels if args.use_bottleneck else None,
-                'use_maxpool': use_maxpool if args.use_bottleneck else None,
-                'pool_size': pool_size if args.use_bottleneck else None,
+                'use_canvas_painter': use_canvas_painter,
+                'latent_size': latent_size if (args.use_bottleneck or use_canvas_painter) else None,
+                'latent_channels': latent_channels if (args.use_bottleneck or use_canvas_painter) else None,
+                'use_maxpool': use_maxpool if (args.use_bottleneck or use_canvas_painter) else None,
+                'pool_size': pool_size if (args.use_bottleneck or use_canvas_painter) else None,
                 'latent_noise_stddev': latent_noise_stddev,
             }
             torch.save(checkpoint, output_dir / 'best_model.pt')

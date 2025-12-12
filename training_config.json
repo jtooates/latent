@@ -1,9 +1,15 @@
 {
-    "latent_size": 32,
+    "latent_size": 48,
     "latent_channels": 3,
-    "learning_rate": 0.001,
+    "learning_rate": 0.00005,
     "use_maxpool": true,
     "pool_size": 2,
     "latent_noise_stddev": 0.0,
-    "classification_weight": 1.0
+    "classification_weight": 1.0,
+    "use_canvas_painter": false,
+    "painter_d_state": 512,
+    "painter_patch_size": 5,
+    "painter_num_steps": 15,
+    "canvas_blur_kernel_size": 0,
+    "canvas_blur_sigma": 1.0
 }
