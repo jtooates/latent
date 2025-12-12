@@ -64,7 +64,8 @@ def save_latent_image(
     Z: torch.Tensor,
     output_path: str,
     normalize: bool = True,
-    norm_method: str = 'minmax'
+    norm_method: str = 'minmax',
+    scale_size: int = None
 ):
     """Save a single latent image to disk.
 
@@ -73,11 +74,17 @@ def save_latent_image(
         output_path: Path to save the image.
         normalize: Whether to normalize before saving.
         norm_method: Normalization method ('minmax' or 'standardize').
+        scale_size: If provided, scale image to (scale_size, scale_size) using nearest neighbor.
     """
     if normalize:
         Z = normalize_latent_image(Z, method=norm_method)
 
     img = tensor_to_pil(Z)
+
+    # Scale up if requested
+    if scale_size is not None:
+        img = img.resize((scale_size, scale_size), Image.NEAREST)
+
     img.save(output_path)
 
 
@@ -87,7 +94,8 @@ def save_latent_images(
     output_dir: str,
     prefix: str = "",
     normalize: bool = True,
-    norm_method: str = 'minmax'
+    norm_method: str = 'minmax',
+    scale_size: int = None
 ):
     """Save multiple latent images with corresponding sentences.
 
@@ -98,6 +106,7 @@ def save_latent_images(
         prefix: Prefix for filenames (e.g., "epoch_10").
         normalize: Whether to normalize before saving.
         norm_method: Normalization method.
+        scale_size: If provided, scale images to (scale_size, scale_size).
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -114,7 +123,7 @@ def save_latent_images(
         filename = f"{prefix}_{i:03d}_{sentence_safe}.png" if prefix else f"{i:03d}_{sentence_safe}.png"
         filepath = output_dir / filename
 
-        save_latent_image(z, str(filepath), normalize=False)  # Already normalized above
+        save_latent_image(z, str(filepath), normalize=False, scale_size=scale_size)  # Already normalized above
 
 
 def create_image_grid(
